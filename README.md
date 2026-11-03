@@ -67,7 +67,11 @@ require("petal").setup({
 
 ## Commit message suggestions
 
-Set `commit_suggest` to a command that reads the staged diff on stdin and prints a commit
+The commit buffer opens above a summary of what is being committed (staged changes, the
+worktree with `-a`, HEAD's changes when amending): each file with its +/− counts, `za` to see
+its diff.
+
+Set `commit_suggest` to a command that reads the diff being committed on stdin and prints a commit
 message. It starts as soon as the commit buffer opens. While the message is empty, the
 suggestion shows as ghost text; press `<c-c><c-s>` to accept it, or `<c-c><c-y>` to accept it
 and commit right away. If you press either before the agent answers, it happens when the message

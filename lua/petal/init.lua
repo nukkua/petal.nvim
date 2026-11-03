@@ -42,8 +42,9 @@ local HAS_GH = vim.fn.executable("gh") == 1
 local PR_CACHE = vim.fn.stdpath("cache") .. "/petal_pr.json"
 
 -- git asks this nvim to edit COMMIT_EDITMSG / git-rebase-todo / TAG_EDITMSG over RPC and waits
--- until M.edit drops the lock (or nvim is gone)
-local EDITOR = [[f(){ case $1 in /*) p=$1;; *) p=$PWD/$1;; esac; touch "$p.nvlock"; "$NVIM_BIN" --server "$NVIM" --remote-expr "luaeval('require(\"petal\").edit(_A)', '$p')" >/dev/null; while [ -e "$p.nvlock" ] && [ -e "$NVIM" ]; do sleep 0.05; done; }; f]]
+-- until M.edit drops the lock (or nvim is gone). It also passes the index git will commit
+-- (-a/--only/paths use a temporary one) and whether the parent git is amending
+local EDITOR = [[f(){ case $1 in /*) p=$1;; *) p=$PWD/$1;; esac; i=${GIT_INDEX_FILE:-}; case $i in ""|/*) ;; *) i=$PWD/$i;; esac; a=$(ps -o args= -p $PPID 2>/dev/null | grep -c -e ' --am'); touch "$p.nvlock"; "$NVIM_BIN" --server "$NVIM" --remote-expr "luaeval('require(\"petal\").edit(_A[1], _A[2], _A[3] > 0)', ['$p', '$i', $a])" >/dev/null; while [ -e "$p.nvlock" ] && [ -e "$NVIM" ]; do sleep 0.05; done; }; f]]
 
 -- defaults only (default = true): a colorscheme can set any of these
 local HL = {
@@ -1082,12 +1083,19 @@ end
 -- +/− and foldable diffs (za zo zc zR zM). <cr>: parent -> that commit, diff line -> file at that line.
 -- Popups (A v X r b …) act on this commit from any row. Merges diff against their first parent.
 -- opts.diff = argv printing a patch: the same view for a range/PR diff, titled rev, with no commit header
+-- opts.win: open in that window instead of the current one (focus stays where it is); opts.summary: files start folded
 function show(rev, opts)
   opts = opts or {}
   local hdr, files, pending = nil, nil, opts.diff and 1 or 2
   local function done()
     pending = pending - 1
     if pending > 0 then return end
+    if opts.win then
+      if not vim.api.nvim_win_is_valid(opts.win) then return end
+      local win = opts.win
+      opts.win, pending = nil, 1
+      return vim.api.nvim_win_call(win, done)
+    end
     if opts.diff then
       if not files then return end
       if #files == 0 then return notify(rev .. ": no changes") end
@@ -1097,7 +1105,7 @@ function show(rev, opts)
     local buf = scratch((opts.stash and "stash " or opts.diff and "diff " or "show ") .. rev, "GitCommit", {})
     local total, open = 0, {}
     for _, f in ipairs(files) do for _, h in ipairs(f.hunks) do total = total + #h.lines end end
-    for i, f in ipairs(files) do open[i] = opts.focus and f.path == opts.focus or (not opts.focus and total <= 400) end
+    for i, f in ipairs(files) do open[i] = opts.focus and f.path == opts.focus or (not opts.focus and not opts.summary and total <= 400) end
     local base = opts.stash and { stash = rev } or opts.diff and {} or { commit = hdr.short }
     local function item(extra) return vim.tbl_extend("force", base, extra or {}) end
     local file_row = {}
@@ -2121,7 +2129,7 @@ end
 -- runs C.commit_suggest on the staged diff as soon as the commit buffer opens; the result shows as
 -- ghost text while the message is empty, and the returned accept() writes it above the # comments
 -- (if still running, it is written when it arrives)
-local function suggest(buf)
+local function suggest(buf, diff)
   local gns = vim.api.nvim_create_namespace("petal.suggest")
   local msg, want, job
   local spin = progress("Commit", "suggesting message")
@@ -2159,7 +2167,7 @@ local function suggest(buf)
   vim.api.nvim_create_autocmd("BufUnload", { buffer = buf, once = true, callback = function()
     if job then pcall(job.kill, job, 15) end -- closed before the agent answered: don't leave it running
   end })
-  git({ "diff", "--cached" }, nil, function(d)
+  git(nil, { raw = diff }, function(d)
     if vim.trim(d.stdout or "") == "" then return spin("nothing staged") end
     job = vim.system(C.commit_suggest, { stdin = d.stdout, text = true, cwd = S.root }, vim.schedule_wrap(function(r)
       job = nil
@@ -2176,17 +2184,35 @@ end
 
 -- called by $GIT_EDITOR over RPC: edit the file here; closing the buffer lets git continue.
 -- closed without :w (or <c-c><c-k>) -> the file is emptied, which makes git abort
-function M.edit(path)
+function M.edit(path, index, amend)
   vim.schedule(function()
     local win = S.buf and vim.fn.bufwinid(S.buf) or -1
     if win ~= -1 then vim.api.nvim_set_current_win(win) end
+    local below, under = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
     -- split, so :wq closes just the editor and lands back on the status
     vim.cmd("aboveleft split " .. vim.fn.fnameescape(path))
     local buf = vim.api.nvim_get_current_buf()
     vim.bo[buf].bufhidden = "wipe"
+    local is_commit = path:match("COMMIT_EDITMSG$")
+    local diff
+    if is_commit then
+      -- amending the root commit: its parent is the empty tree
+      local base = amend and (base_of("HEAD") == "--root"
+        and vim.trim(vim.system({ "git", "hash-object", "-t", "tree", "/dev/null" }, { cwd = S.root }):wait().stdout) or "HEAD^")
+      diff = cat(index and index ~= "" and { "env", "GIT_INDEX_FILE=" .. index } or {}, { "git", "diff", "--cached" }, base and { base } or {})
+    end
+    -- the changes being committed go in the window below: a summary of the files (+/−), za expands one
+    if diff then show("to commit", { diff = diff, win = below, summary = true }) end
     local written = false
     vim.api.nvim_create_autocmd("BufWritePost", { buffer = buf, callback = function() written = true end })
     vim.api.nvim_create_autocmd("BufUnload", { buffer = buf, once = true, callback = function()
+      if diff and vim.api.nvim_win_is_valid(below) then
+        local b = vim.api.nvim_win_get_buf(below)
+        if vim.api.nvim_buf_get_name(b):match("git://diff to commit$") then
+          if vim.api.nvim_buf_is_valid(under) then vim.api.nvim_win_set_buf(below, under) end
+          pcall(vim.api.nvim_buf_delete, b, { force = true })
+        end
+      end
       if not written then
         local f = io.open(path, "w")
         if f then f:close() end
@@ -2196,8 +2222,8 @@ function M.edit(path)
     local o = { buffer = buf }
     vim.keymap.set({ "n", "i" }, "<c-c><c-c>", function() vim.cmd("stopinsert | write | bwipeout") end, o)
     vim.keymap.set({ "n", "i" }, "<c-c><c-k>", function() written = false; vim.cmd("stopinsert | bwipeout!") end, o)
-    if C.commit_suggest and path:match("COMMIT_EDITMSG$") then
-      local accept = suggest(buf)
+    if C.commit_suggest and is_commit then
+      local accept = suggest(buf, diff)
       vim.keymap.set({ "n", "i" }, "<c-c><c-s>", function() accept() end, vim.tbl_extend("force", o, { desc = "Accept suggested commit message" }))
       vim.keymap.set({ "n", "i" }, "<c-c><c-y>", function() accept(true) end, vim.tbl_extend("force", o, { desc = "Commit with the suggested message" }))
     end

@@ -132,7 +132,8 @@ Key     Action           Does ~
 Log views get the popup keys (`$` to `Z` above) plus goto and help; commit and
 diff views also get the fold keys.
 
-In the commit message buffer:
+In the commit message buffer (the window below lists the files being
+committed with +/- counts; `za` on one shows its diff, `q` closes it):
 <C-c><C-c>              Save and commit
 <C-c><C-k>              Abort
 <C-c><C-s>              Accept the suggested message |petal-commit-suggest|
@@ -191,7 +192,7 @@ branch under "Push" (state, mergeable, review, CI). `O` opens the PR popup:
 ==============================================================================
 8. COMMIT MESSAGE SUGGESTIONS                           *petal-commit-suggest*
 
-Set `commit_suggest` to a command that reads the staged diff on stdin and
+Set `commit_suggest` to a command that reads the diff being committed on stdin and
 prints a commit message. It starts when the commit buffer opens; the
 suggestion shows as ghost text while the message is empty. <C-c><C-s>
 accepts it, <C-c><C-y> accepts it and commits at once; pressed early, either
