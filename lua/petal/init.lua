@@ -5,6 +5,7 @@
 -- helper); a ' in a repo path breaks the $EDITOR bridge
 
 local M = {}
+
 -- user options, see README / M.setup
 local C = {
   reviewers = {},                                      -- offered by PR create (gh); empty = never asks
