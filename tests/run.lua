@@ -167,6 +167,20 @@ test("patch: no newline at end of file", function()
   git({ "checkout", "--", "f.txt" })
 end)
 
+test("split_diff: batched diff matches per-file diffs", function()
+  write("a b.txt", { "1" }); write("gone.txt", { "1" }); write("old.txt", { "1", "2", "3" })
+  git({ "add", "." }); git({ "commit", "-qm", "split" })
+  write("a b.txt", { "2" }); vim.fn.delete(dir .. "/gone.txt")
+  git({ "mv", "old.txt", "new.txt" }); write("new.txt", { "1", "2", "3", "4" }); git({ "add", "new.txt" })
+  local by = t.split_diff(git({ "diff", "--src-prefix=a/", "--dst-prefix=b/", "--" , "a b.txt", "gone.txt" }))
+  for _, p in ipairs({ "a b.txt", "gone.txt" }) do
+    eq(table.concat(by["diff --git a/" .. p .. " b/" .. p], "\n") .. "\n", git({ "diff", "--", p }), p)
+  end
+  by = t.split_diff(git({ "diff", "--cached", "--src-prefix=a/", "--dst-prefix=b/", "--", "new.txt", "old.txt" }))
+  eq(table.concat(by["diff --git a/old.txt b/new.txt"], "\n") .. "\n", git({ "diff", "--cached", "--", "new.txt", "old.txt" }))
+  git({ "reset", "-q", "--hard" })
+end)
+
 ---------------------------------------------------------------- mappings
 
 test("mappings: default, drop, add, rebind", function()

@@ -385,6 +385,20 @@ local function diff_args(f)
   return cat({ "diff" }, f.section == "staged" and { "--cached" } or {}, { "--", f.path, f.orig })
 end
 
+-- one batched `git diff` per section, split back per file by its `diff --git` header (a typechange
+-- emits two sections with the same header; they concatenate, as a per-file diff would)
+local function split_diff(out)
+  local by, cur = {}, nil
+  for _, l in ipairs(lines(out)) do
+    if l:sub(1, 11) == "diff --git " then cur = l; by[cur] = by[cur] or {} end
+    if cur then table.insert(by[cur], l) end
+  end
+  return by
+end
+-- ponytail: paths git would quote ("\ or control chars) can't be matched by header; they get their own diff
+local function batchable(f) return not (f.path .. (f.orig or "")):find('[%c"\\]') end
+local function diff_header(f) return "diff --git a/" .. (f.orig or f.path) .. " b/" .. f.path end
+
 local function fkey(f) return f.section .. ":" .. f.path end
 
 local function key(it)
@@ -941,11 +955,26 @@ function M.refresh()
     d.remotes, d.remoteset = lines(r.stdout), {}
     for _, x in ipairs(d.remotes) do d.remoteset[x] = true end
   end)
+  -- one diff per section, not one process per open file: zR on 200 files was 200 spawns every refresh
+  local batch = { unstaged = {}, staged = {} }
   for k, f in pairs(S.open) do
     if f.mode == "U" then
       diffs[k] = { conflicts = parse_conflicts(S.root .. "/" .. f.path) }
+    elseif batch[f.section] and batchable(f) then
+      table.insert(batch[f.section], { k, f })
     else
       step(diff_args(f), function(r) diffs[k] = parse_diff(r.stdout) end)
+    end
+  end
+  for sec, fs in pairs(batch) do
+    if #fs > 0 then
+      local args = cat({ "-c", "core.quotePath=false", "diff", "--src-prefix=a/", "--dst-prefix=b/" },
+        sec == "staged" and { "--cached" } or {}, { "--" })
+      for _, e in ipairs(fs) do vim.list_extend(args, { e[2].path, e[2].orig }) end
+      step(args, function(r)
+        local by = split_diff(r.stdout)
+        for _, e in ipairs(fs) do diffs[e[1]] = parse_diff(table.concat(by[diff_header(e[2])] or {}, "\n")) end
+      end)
     end
   end
 end
@@ -2153,10 +2182,18 @@ function M.open()
     M.maps(S.buf)
     -- BufWinEnter, not BufEnter: coming back from a popup/picker window is not a reason to refresh
     vim.api.nvim_create_autocmd("BufWinEnter", { buffer = S.buf, callback = function() M.refresh() end })
-    vim.api.nvim_create_autocmd({ "BufWritePost", "FocusGained" }, { callback = function()
-      if S.buf and vim.fn.bufwinid(S.buf) ~= -1 then M.refresh() end
+    -- group cleared: a wiped and recreated status buffer must not stack another set of global handlers
+    local aug, queued = vim.api.nvim_create_augroup("petal_status", { clear = true }), false
+    local function visible() return S.buf and vim.fn.bufwinid(S.buf) ~= -1 end
+    -- :wa fires BufWritePost once per buffer in one tick; queue a single refresh instead of 8 git processes each
+    vim.api.nvim_create_autocmd({ "BufWritePost", "FocusGained" }, { group = aug, callback = function()
+      if queued or not visible() then return end
+      queued = true
+      vim.schedule(function() queued = false; if visible() then M.refresh() end end)
     end })
-    vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, { callback = function() render() end }) -- subjects re-fit
+    vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, { group = aug, callback = function() -- subjects re-fit
+      if visible() then render() end
+    end })
   end
   local cur = vim.api.nvim_get_current_buf()
   if cur ~= S.buf then
@@ -2281,7 +2318,7 @@ M._t = {
     for _, g in ipairs(KEYS) do for _, k in ipairs(g[2]) do t[k[2]] = true end end
     return t
   end,
-  bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, parse_conflicts = parse_conflicts,
+  bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_conflicts = parse_conflicts,
   parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary, failure = failure,
 }
 
