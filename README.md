@@ -14,10 +14,10 @@ GitHub PR support through `gh`.
 
 ```lua
 -- vim.pack
-vim.pack.add({ "https://github.com/<you>/petal.nvim" })
+vim.pack.add({ "https://github.com/nukkua/petal.nvim" })
 
 -- lazy.nvim
-{ "<you>/petal.nvim", opts = {} }
+{ "nukkua/petal.nvim", opts = {} }
 ```
 
 ## Setup
