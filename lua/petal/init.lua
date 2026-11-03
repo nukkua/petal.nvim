@@ -13,8 +13,13 @@ local C = {
   height = 12,                                         -- height of the bottom pickers/popups
   commit_suggest = nil,                                -- argv: staged diff on stdin -> commit message on stdout;
                                                        -- runs when the commit buffer opens, <c-c><c-s> accepts
+  mappings = {},                                       -- status keys: { [key] = action name | false }, see :h petal-mappings
 }
-function M.setup(opts) C = vim.tbl_extend("force", C, opts or {}) end -- shallow: list options replace, not merge
+local BIND
+function M.setup(opts) -- shallow: list options replace, not merge
+  C = vim.tbl_extend("force", C, opts or {})
+  BIND = nil
+end
 
 local S = {
   root = nil, gitdir = nil, buf = nil, prev = nil,
@@ -708,6 +713,7 @@ local function pr_line(branch)
 end
 
 local PR = {}
+local show
 
 function PR.status()
   local spin = progress("PR", "gh pr view")
@@ -726,14 +732,14 @@ function PR.status()
   end)
 end
 
-function PR.list()
+local function pr_pick(prompt, cb)
   local spin = progress("PRs", "gh pr list")
   gh({ "pr", "list", "--limit", "30", "--json", "number,title,author,headRefName,isDraft,state,reviewDecision,statusCheckRollup,url" }, {}, function(r)
     local prs = json(r)
     if r.code ~= 0 then spin("failed") return notify(r.stderr, vim.log.levels.ERROR) end
     spin(prs and #prs > 0 and (#prs .. " PRs") or "no PRs")
     if not prs or #prs == 0 then return end
-    require("petal.select").select(prs, { prompt = "PRs", height = C.height, format_item = function(pr)
+    require("petal.select").select(prs, { prompt = prompt, height = C.height, format_item = function(pr)
       local s = pr_state(pr)
       local ci, ci_hl = ci_summary(pr.statusCheckRollup)
       local login = type(pr.author) == "table" and str(pr.author.login, "?") or "?"
@@ -742,10 +748,57 @@ function PR.list()
         { "  " .. str(pr.title) }, { "  " .. str(pr.headRefName), "PrBranch" }, { "  @" .. login, "Comment" },
         { " · " .. str(pr.reviewDecision, "no review"), "Comment" }, { " · " .. ci, ci_hl },
       }
-    end }, function(pr)
-      if not pr then return end
-      vim.fn.setreg("+", str(pr.url))
-      notify("PR URL copied:\n" .. str(pr.url))
+    end }, function(pr) if pr then cb(pr) end end)
+  end)
+end
+
+function PR.list()
+  pr_pick("PRs", function(pr)
+    vim.fn.setreg("+", str(pr.url))
+    notify("PR URL copied:\n" .. str(pr.url))
+  end)
+end
+
+function PR.checkout()
+  pr_pick("Checkout PR", function(pr)
+    local n = str(pr.number)
+    act(nil, { raw = { "gh", "pr", "checkout", n }, msg = "Checking out #" .. n, after = function() S.pr_at = {} end })
+  end)
+end
+
+local CHECK_HL = { pass = "PrOpen", fail = "PrClosed", cancel = "PrClosed", pending = "PrWarn", skipping = "Comment" }
+
+function PR.checks()
+  local spin = progress("PR", "gh pr checks")
+  gh({ "pr", "checks", "--json", "name,workflow,bucket,link" }, {}, function(r)
+    local cs = json(r) -- exit code is non-zero whenever a check fails or is pending
+    if not cs then spin("failed") return notify(vim.trim(r.stderr or ""), vim.log.levels.ERROR) end
+    spin(#cs .. " checks")
+    if #cs == 0 then return end
+    local function rank(c) return c.bucket == "fail" and 0 or c.bucket == "pending" and 1 or 2 end
+    table.sort(cs, function(a, b) return rank(a) < rank(b) end)
+    require("petal.select").select(cs, { prompt = "Checks", height = C.height, format_item = function(c)
+      local wf = str(c.workflow)
+      return { { ("%-8s"):format(str(c.bucket, "?")), CHECK_HL[c.bucket] or "Comment" },
+        { "  " .. (wf ~= "" and (wf .. " / ") or "") .. str(c.name) } }
+    end }, function(c)
+      if not c then return end
+      local link = str(c.link)
+      local job, run = link:match("/job/(%d+)"), link:match("/actions/runs/(%d+)")
+      if c.bucket ~= "fail" or not (job or run) then
+        if link ~= "" then vim.ui.open(link) end
+        return
+      end
+      local lspin = progress("CI", "gh run view --log-failed")
+      gh(cat({ "run", "view" }, job and { "--job", job } or { run }, { "--log-failed" }), {}, function(lr)
+        if lr.code ~= 0 then lspin("failed") return notify(vim.trim(lr.stderr or ""), vim.log.levels.ERROR) end
+        if vim.trim(lr.stdout or "") == "" then
+          lspin("no log yet, opening the page")
+          return vim.ui.open(link)
+        end
+        lspin()
+        scratch("ci " .. str(c.name), "", lr.stdout)
+      end)
     end)
   end)
 end
@@ -787,6 +840,10 @@ function PR.open()
     vim.ui.open(url)
     spin("URL copied: " .. url)
   end)
+end
+
+function PR.diff()
+  show("pull request", { diff = { "gh", "pr", "diff", "--color=never" }, msg = "PR" })
 end
 
 function PR.close()
@@ -1024,52 +1081,62 @@ end
 -- one commit (or stash), same look as the status: header, kind-colored message, files with
 -- +/− and foldable diffs (za zo zc zR zM). <cr>: parent -> that commit, diff line -> file at that line.
 -- Popups (A v X r b …) act on this commit from any row. Merges diff against their first parent.
-local function show(rev, opts)
+-- opts.diff = argv printing a patch: the same view for a range/PR diff, titled rev, with no commit header
+function show(rev, opts)
   opts = opts or {}
-  local hdr, files, pending = nil, nil, 2
+  local hdr, files, pending = nil, nil, opts.diff and 1 or 2
   local function done()
     pending = pending - 1
     if pending > 0 then return end
-    if not hdr then return notify(rev .. ": not found", vim.log.levels.WARN) end
-    local buf = scratch((opts.stash and "stash " or "show ") .. rev, "GitCommit", {})
+    if opts.diff then
+      if not files then return end
+      if #files == 0 then return notify(rev .. ": no changes") end
+    elseif not hdr then
+      return notify(rev .. ": not found", vim.log.levels.WARN)
+    end
+    local buf = scratch((opts.stash and "stash " or opts.diff and "diff " or "show ") .. rev, "GitCommit", {})
     local total, open = 0, {}
     for _, f in ipairs(files) do for _, h in ipairs(f.hunks) do total = total + #h.lines end end
     for i, f in ipairs(files) do open[i] = opts.focus and f.path == opts.focus or (not opts.focus and total <= 400) end
-    local base = opts.stash and { stash = rev } or { commit = hdr.short }
+    local base = opts.stash and { stash = rev } or opts.diff and {} or { commit = hdr.short }
     local function item(extra) return vim.tbl_extend("force", base, extra or {}) end
     local file_row = {}
 
     local function draw()
       local add, L, H, R = builder()
       local sub = "GitSubtleText"
-      local head = { { "Commit   ", sub }, { hdr.short, "GitObjectId" }, { " " } }
-      local rc = {}
-      if not opts.stash then refchunks(hdr.refs, rc, S.data and S.data.remoteset or {}) end -- refs/stash is noise
-      if #rc > 0 then
-        rc[#rc] = nil
-        head[#head + 1] = { "(", sub }
-        vim.list_extend(head, rc)
-        head[#head + 1] = { ")", sub }
+      if opts.diff then
+        add({ { "Diff     ", sub }, { rev, "GitObjectId" } }, item())
+      else
+        local head = { { "Commit   ", sub }, { hdr.short, "GitObjectId" }, { " " } }
+        local rc = {}
+        if not opts.stash then refchunks(hdr.refs, rc, S.data and S.data.remoteset or {}) end -- refs/stash is noise
+        if #rc > 0 then
+          rc[#rc] = nil
+          head[#head + 1] = { "(", sub }
+          vim.list_extend(head, rc)
+          head[#head + 1] = { ")", sub }
+        end
+        add(head, item())
+        add({ { "Author   ", sub }, { hdr.author, "GitGraphAuthor" }, { " <" .. hdr.email .. ">", sub },
+          { " · " .. age(hdr.at) .. " · " .. os.date("%Y-%m-%d %H:%M", tonumber(hdr.at)), sub } }, item())
+        if #hdr.parents > 1 and not opts.stash then
+          local ch = { { "Merge    ", sub } }
+          for _, par in ipairs(hdr.parents) do vim.list_extend(ch, { { par:sub(1, 7), "GitObjectId" }, { " " } }) end
+          ch[#ch + 1] = { " diff vs first parent", sub }
+          add(ch, item({ parents = hdr.parents }))
+        end
+        add({ { "" } }, item())
+        local subject, on = hdr.subject, nil
+        if opts.stash then -- "On main: msg" / "WIP on main: abc msg" -> msg · on main
+          on, subject = subject:match("^%a+ on (.-): (.*)$")
+          if not on then on, subject = hdr.subject:match("^On (.-): (.*)$") end
+          subject = subject or hdr.subject
+        end
+        local kind, detail = kind_of(subject)
+        add(cat(kind and { { kind, kind_hl(kind) }, { " " .. detail } } or { { detail } }, on and { { " · on " .. on, sub } } or {}), item())
+        for _, l in ipairs(hdr.body) do add({ { l } }, item()) end
       end
-      add(head, item())
-      add({ { "Author   ", sub }, { hdr.author, "GitGraphAuthor" }, { " <" .. hdr.email .. ">", sub },
-        { " · " .. age(hdr.at) .. " · " .. os.date("%Y-%m-%d %H:%M", tonumber(hdr.at)), sub } }, item())
-      if #hdr.parents > 1 and not opts.stash then
-        local ch = { { "Merge    ", sub } }
-        for _, par in ipairs(hdr.parents) do vim.list_extend(ch, { { par:sub(1, 7), "GitObjectId" }, { " " } }) end
-        ch[#ch + 1] = { " diff vs first parent", sub }
-        add(ch, item({ parents = hdr.parents }))
-      end
-      add({ { "" } }, item())
-      local subject, on = hdr.subject, nil
-      if opts.stash then -- "On main: msg" / "WIP on main: abc msg" -> msg · on main
-        on, subject = subject:match("^%a+ on (.-): (.*)$")
-        if not on then on, subject = hdr.subject:match("^On (.-): (.*)$") end
-        subject = subject or hdr.subject
-      end
-      local kind, detail = kind_of(subject)
-      add(cat(kind and { { kind, kind_hl(kind) }, { " " .. detail } } or { { detail } }, on and { { " · on " .. on, sub } } or {}), item())
-      for _, l in ipairs(hdr.body) do add({ { l } }, item()) end
       add({ { "" } }, item())
 
       local A, D, pw = 0, 0, 0
@@ -1102,8 +1169,6 @@ local function show(rev, opts)
       for i, f in ipairs(files) do if f.path == opts.focus then pcall(vim.api.nvim_win_set_cursor, 0, { file_row[i], 0 }) end end
     end
 
-    M.maps(buf, true)
-    local o = { buffer = buf, nowait = true }
     local function cur() return (S.rows[buf] or {})[vim.fn.line(".")] or {} end
     local function fold(op)
       local i = cur().vfile
@@ -1116,12 +1181,7 @@ local function show(rev, opts)
       for i in ipairs(files) do open[i] = v end
       draw()
     end
-    vim.keymap.set("n", "za", function() fold("a") end, o)
-    vim.keymap.set("n", "zo", function() fold("o") end, o)
-    vim.keymap.set("n", "zc", function() fold("c") end, o)
-    vim.keymap.set("n", "zR", function() all(true) end, o)
-    vim.keymap.set("n", "zM", function() all(false) end, o)
-    vim.keymap.set("n", "<cr>", function()
+    local function go()
       local it = cur()
       if it.parents then
         local w = vim.fn.expand("<cword>")
@@ -1139,22 +1199,33 @@ local function show(rev, opts)
       end
       vim.cmd.edit(vim.fn.fnameescape(abs))
       if lnum then pcall(vim.api.nvim_win_set_cursor, 0, { math.max(lnum, 1), 0 }) end
-    end, o)
-  end
-  git({ "log", "-1", "--format=%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%at%x1f%P%x1f%B", rev }, nil, function(r)
-    local t = vim.split(r.stdout or "", "\31", { plain = true })
-    if r.code == 0 and #t >= 8 then
-      local msg = vim.split(vim.trim(table.concat(vim.list_slice(t, 8), "\31")), "\n", { plain = true })
-      local body = vim.list_slice(msg, 2)
-      while body[1] == "" do table.remove(body, 1) end
-      hdr = { short = t[2], refs = t[3], author = t[4], email = t[5], at = t[6], parents = vim.split(t[7], " ", { trimempty = true }),
-        subject = msg[1] or "", body = body }
     end
-    done()
-  end)
-  git(opts.stash and { "stash", "show", "-p", "--include-untracked", rev }
-    or { "show", "--format=", "--patch", "--diff-merges=first-parent", rev }, nil, function(r)
-    files = parse_files(r.stdout)
+    M.maps(buf, true, { ["goto"] = go, toggle_fold = function() fold("a") end, open_fold = function() fold("o") end,
+      close_fold = function() fold("c") end, open_all = function() all(true) end, close_all = function() all(false) end })
+  end
+  if not opts.diff then
+    git({ "log", "-1", "--format=%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%at%x1f%P%x1f%B", rev }, nil, function(r)
+      local t = vim.split(r.stdout or "", "\31", { plain = true })
+      if r.code == 0 and #t >= 8 then
+        local msg = vim.split(vim.trim(table.concat(vim.list_slice(t, 8), "\31")), "\n", { plain = true })
+        local body = vim.list_slice(msg, 2)
+        while body[1] == "" do table.remove(body, 1) end
+        hdr = { short = t[2], refs = t[3], author = t[4], email = t[5], at = t[6], parents = vim.split(t[7], " ", { trimempty = true }),
+          subject = msg[1] or "", body = body }
+      end
+      done()
+    end)
+  end
+  local spin = opts.msg and progress(opts.msg, rev)
+  git(nil, { raw = opts.diff or (opts.stash and { "git", "stash", "show", "-p", "--include-untracked", rev })
+    or { "git", "show", "--format=", "--patch", "--diff-merges=first-parent", rev } }, function(r)
+    if opts.diff and r.code ~= 0 then
+      if spin then spin("failed") end
+      notify(vim.trim(r.stderr or "") ~= "" and vim.trim(r.stderr) or (rev .. ": diff failed"), vim.log.levels.ERROR)
+    else
+      if spin then spin() end
+      files = parse_files(r.stdout)
+    end
     done()
   end)
 end
@@ -1884,11 +1955,27 @@ function P.pr()
       { "l", "List", PR.list },
       { "o", "Open + copy URL", PR.open },
     } },
+    { "Review", {
+      { "c", "Checkout", PR.checkout },
+      { "d", "Diff", PR.diff },
+      { "k", "Checks / CI log", PR.checks },
+    } },
     { "Do", {
       { "n", "Create (reviewer)", PR.create },
       { "x", "Close", PR.close },
     } },
   } })
+end
+
+function P.diff()
+  local function range(r) show(r, { diff = cat({ "git", "diff" }, vim.split(r, "%s+", { trimempty = true })) }) end
+  popup({ title = "Diff", groups = { { "Diff", {
+    { "b", "Branch vs base", function() find_base(function(b) range(b .. "...HEAD") end) end },
+    { "r", "Branch vs ref", function()
+      refs({ "refs/heads", "refs/remotes" }, function(l) pick("Diff against", l, function(b) range(b .. "...HEAD") end) end)
+    end },
+    { "c", "Range", function(_, ctx) input("Diff range: ", ctx.commit and (ctx.commit .. "..HEAD") or nil, range) end },
+  } } } })
 end
 
 ---------------------------------------------------------------- keys
@@ -1904,49 +1991,87 @@ end
 local function with(fn) return function() fn(context()) end end
 
 local KEYS
+
+-- KEYS with C.mappings applied: { key = false } drops a key, { key = "action" } binds it (replacing its default)
+local function bindings()
+  if BIND then return BIND end
+  local map, by = C.mappings or {}, {}
+  BIND = {}
+  for gi, g in ipairs(KEYS) do
+    local list = {}
+    for _, k in ipairs(g[2]) do
+      by[k[2]] = gi
+      if map[k[1]] == nil then list[#list + 1] = k end
+    end
+    BIND[gi] = { g[1], list }
+  end
+  local keys = vim.tbl_keys(map)
+  table.sort(keys)
+  for _, key in ipairs(keys) do
+    local name = map[key]
+    local gi = by[name]
+    if gi then
+      for _, k in ipairs(KEYS[gi][2]) do
+        if k[2] == name then table.insert(BIND[gi][2], { key, k[2], k[3], k[4], k[5] }) end
+      end
+    elseif name ~= false then
+      notify(("mappings[%q]: unknown action %q (see :h petal-actions)"):format(key, tostring(name)), vim.log.levels.WARN)
+    end
+  end
+  return BIND
+end
+
 local function help()
   local groups = {}
-  for _, g in ipairs(KEYS) do
+  for _, g in ipairs(bindings()) do
     local acts = {}
-    for _, k in ipairs(g[2]) do acts[#acts + 1] = { k[1], k[2], function() k[3]() end } end
+    for _, k in ipairs(g[2]) do acts[#acts + 1] = { k[1], k[3], function() k[4]() end } end
     groups[#groups + 1] = { g[1], acts }
   end
   popup({ title = "Help", groups = groups })
 end
 
--- { key, desc, fn, visual? }
+-- { key, action, desc, fn, visual? }
 KEYS = {
   { "Commands", {
-    { "$", "History", history }, { "A", "Cherry Pick", P.cherry, true }, { "b", "Branch", P.branch },
-    { "B", "Bisect", P.bisect }, { "c", "Commit", P.commit }, { "f", "Fetch", P.fetch },
-    { "l", "Log / reflog", P.log }, { "M", "Remote", P.remote }, { "m", "Merge", P.merge },
+    { "$", "history", "History", history }, { "A", "cherry_pick", "Cherry Pick", P.cherry, true },
+    { "b", "branch", "Branch", P.branch }, { "B", "bisect", "Bisect", P.bisect }, { "c", "commit", "Commit", P.commit },
+    { "D", "diff_range", "Diff (branch/range)", P.diff }, { "f", "fetch", "Fetch", P.fetch },
+    { "l", "log", "Log / reflog", P.log }, { "M", "remote", "Remote", P.remote }, { "m", "merge", "Merge", P.merge },
   } },
   { "", {
-    { "O", "PRs", P.pr }, { "p", "Pull", P.pull }, { "P", "Push", P.push }, { "Q", "Command", M.command },
-    { "r", "Rebase", P.rebase }, { "t", "Tag", P.tag }, { "v", "Revert", P.revert, true }, { "X", "Reset", P.reset },
-    { "Z", "Stash", P.stash },
+    { "O", "pr", "PRs", P.pr }, { "p", "pull", "Pull", P.pull }, { "P", "push", "Push", P.push },
+    { "Q", "command", "Command", M.command }, { "r", "rebase", "Rebase", P.rebase }, { "t", "tag", "Tag", P.tag },
+    { "v", "revert", "Revert", P.revert, true }, { "X", "reset", "Reset", P.reset }, { "Z", "stash", "Stash", P.stash },
   } },
   { "Applying changes", {
-    { "<c-s>", "Stage all", function() act({ "add", "-A" }) end }, { "K", "Untrack", with(untrack), true },
-    { "s", "Stage", with(stage), true }, { "S", "Stage unstaged", function() act({ "add", "-u" }) end },
-    { "u", "Unstage", with(unstage), true }, { "U", "Unstage all", unstage_all }, { "x", "Discard", with(discard), true },
-    { "d", "Diff mode (against HEAD)", vimdiff }, { "e", "Merge mode (conflict)", merge_mode },
+    { "<c-s>", "stage_all", "Stage all", function() act({ "add", "-A" }) end },
+    { "K", "untrack", "Untrack", with(untrack), true },
+    { "s", "stage", "Stage", with(stage), true },
+    { "S", "stage_unstaged", "Stage unstaged", function() act({ "add", "-u" }) end },
+    { "u", "unstage", "Unstage", with(unstage), true }, { "U", "unstage_all", "Unstage all", unstage_all },
+    { "x", "discard", "Discard", with(discard), true },
+    { "d", "diff", "Diff mode (against HEAD)", vimdiff }, { "e", "merge_mode", "Merge mode (conflict)", merge_mode },
   } },
   { "Essential commands", {
-    { "<c-r>", "Refresh", M.refresh }, { "<cr>", "Go to file", goto_item },
-    { "za", "Toggle fold", function() fold("a") end }, { "zo", "Open fold", function() fold("o") end },
-    { "zc", "Close fold", function() fold("c") end }, { "zR", "Open all", function() fold_all(true) end },
-    { "zM", "Close all", function() fold_all(false) end },
-    { "?", "Help", help }, { "q", "Close", close },
+    { "<c-r>", "refresh", "Refresh", M.refresh }, { "<cr>", "goto", "Go to file", goto_item },
+    { "za", "toggle_fold", "Toggle fold", function() fold("a") end },
+    { "zo", "open_fold", "Open fold", function() fold("o") end },
+    { "zc", "close_fold", "Close fold", function() fold("c") end },
+    { "zR", "open_all", "Open all", function() fold_all(true) end },
+    { "zM", "close_all", "Close all", function() fold_all(false) end },
+    { "?", "help", "Help", help }, { "q", "close", "Close", close },
   } },
 }
 
--- log view only gets the commands + <cr>/?: applying keys mean nothing there
-function M.maps(buf, log)
-  for gi, g in ipairs(KEYS) do
+-- log/show views get the commands + goto/help (applying keys mean nothing there);
+-- over[action] = fn replaces that action's fn and maps it there too
+function M.maps(buf, log, over)
+  over = over or {}
+  for gi, g in ipairs(bindings()) do
     for _, k in ipairs(g[2]) do
-      if not log or gi <= 2 or k[1] == "<cr>" or k[1] == "?" then
-        vim.keymap.set(k[4] and { "n", "x" } or "n", k[1], k[3], { buffer = buf, nowait = true, desc = k[2] })
+      if not log or gi <= 2 or over[k[2]] or k[2] == "goto" or k[2] == "help" then
+        vim.keymap.set(k[5] and { "n", "x" } or "n", k[1], over[k[2]] or k[4], { buffer = buf, nowait = true, desc = k[3] })
       end
     end
   end
@@ -2073,5 +2198,17 @@ function M.edit(path)
     if vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "" then vim.cmd.startinsert() end
   end)
 end
+
+-- for tests and :checkhealth
+M._t = {
+  config = function() return C end,
+  actions = function()
+    local t = {}
+    for _, g in ipairs(KEYS) do for _, k in ipairs(g[2]) do t[k[2]] = true end end
+    return t
+  end,
+  bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, parse_conflicts = parse_conflicts,
+  parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary,
+}
 
 return M
