@@ -1184,7 +1184,12 @@ function show(rev, opts)
     for _, f in ipairs(files) do for _, h in ipairs(f.hunks) do total = total + #h.lines end end
     for i, f in ipairs(files) do open[i] = opts.focus and f.path == opts.focus or (not opts.focus and not opts.summary and total <= 400) end
     local base = opts.stash and { stash = rev } or opts.diff and {} or { commit = hdr.short }
-    local function item(extra) return vim.tbl_extend("force", base, extra or {}) end
+    -- base and extra never share keys; a plain copy, not tbl_extend: this runs once per row
+    local function item(extra)
+      local t = extra or {}
+      for k, v in pairs(base) do t[k] = v end
+      return t
+    end
     local file_row = {}
 
     local function draw()
@@ -1239,9 +1244,11 @@ function show(rev, opts)
         if open[i] then
           for _, h in ipairs(f.hunks) do
             add({ { h.header, "GitHunkHeader" } }, item({ vfile = i, hunk = h, idx = 0 }))
-            for j, l in ipairs(h.lines) do
-              local c = l:sub(1, 1)
-              add({ { l, c == "+" and "GitDiffAdd" or c == "-" and "GitDiffDelete" or nil } }, item({ vfile = i, hunk = h, idx = j }))
+            for j, l in ipairs(h.lines) do -- hot loop: add() inlined, as in the status
+              local c, n = l:byte(1), #L
+              local g = c == 43 and "GitDiffAdd" or c == 45 and "GitDiffDelete" or nil -- + -
+              if g then H[#H + 1] = { n, 0, #l, g } end
+              L[n + 1], R[n + 1] = l, item({ vfile = i, hunk = h, idx = j })
             end
           end
         end
@@ -1524,7 +1531,8 @@ local function vimdiff()
   if not (it and it.file) then return notify("diff: no file under cursor", vim.log.levels.WARN) end
   if it.file.mode == "U" then return merge_mode() end -- HEAD alone says nothing about a conflict
   local root, rel = S.root, it.file.path
-  vim.fn.system({ "git", "-C", root, "cat-file", "-e", "HEAD:" .. rel })
+  -- one blocking process, not two: a failed show is the "not in HEAD" check
+  local head = vim.fn.systemlist({ "git", "-C", root, "show", "HEAD:" .. rel })
   if vim.v.shell_error ~= 0 then return notify("diff: untracked, nothing in HEAD to diff against", vim.log.levels.WARN) end
   -- ponytail: one diff at a time; repeat-d replaces instead of stacking splits
   vim.cmd("diffoff!")
@@ -1543,7 +1551,6 @@ local function vimdiff()
   local ft = vim.bo.filetype
   vim.cmd("diffthis")
   vim.api.nvim_set_option_value("winbar", "%#Comment# working %*", { win = work_win })
-  local head = vim.fn.systemlist({ "git", "-C", root, "show", "HEAD:" .. rel })
   vim.cmd("vnew")
   local head_win = vim.api.nvim_get_current_win()
   vim.api.nvim_buf_set_lines(0, 0, -1, false, head)
