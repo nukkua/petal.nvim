@@ -253,6 +253,37 @@ test("failure: real git output -> short message + level", function()
   eq(t.failure({ code = 3, stderr = "", stdout = "" }), "exited 3")
 end)
 
+-- end to end through the UI (last: it opens the status in its own repo)
+test("move_hunk: hunk moves to a later commit, end result unchanged", function()
+  local mdir = vim.fn.tempname()
+  vim.fn.mkdir(mdir, "p")
+  local function mgit(args) local r = vim.system(vim.list_extend({ "git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false" }, args), { cwd = mdir, text = true }):wait(); assert(r.code == 0, r.stderr); return r.stdout end
+  local L = {}
+  for i = 1, 12 do L[i] = "line " .. i end
+  local function set(i, v) L[i] = v vim.fn.writefile(L, mdir .. "/app.lua") end
+  mgit({ "init", "-q", "-b", "main" }); set(1, "line 1"); mgit({ "add", "." }); mgit({ "commit", "-qm", "base" })
+  set(2, "cache = {}"); set(10, "cache.ttl = 60"); mgit({ "commit", "-qam", "feat: add cache" })
+  set(6, "log('hit')"); mgit({ "commit", "-qam", "fix: logging" })
+  local tree = mgit({ "rev-parse", "HEAD^{tree}" })
+  local real = package.loaded["petal.select"]
+  package.loaded["petal.select"] = { select = function(items, _, cb) for _, it in ipairs(items) do if it:find("fix: logging", 1, true) then return cb(it) end end end }
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(mdir)
+  petal.open()
+  vim.wait(5000, function() return vim.fn.search("Recent", "nw") > 0 end, 10)
+  vim.fn.search("^\\* \\x\\+ .*add cache")
+  vim.api.nvim_feedkeys(vim.keycode("<cr>"), "x", false)
+  vim.wait(3000, function() return vim.fn.search("^+cache.ttl", "w") > 0 end, 10)
+  vim.api.nvim_feedkeys("o", "x", false)
+  vim.wait(5000, function() return mgit({ "log", "-1", "--format=%s", "HEAD~1" }) == "feat: add cache\n" and not mgit({ "show", "HEAD~1" }):find("cache.ttl") end, 20)
+  package.loaded["petal.select"] = real
+  vim.cmd.cd(cwd)
+  eq(mgit({ "show", "--format=", "-U0", "HEAD~1" }):match("\n(%+cache[^\n]*)"), "+cache = {}")
+  assert(mgit({ "show", "HEAD" }):find("+cache.ttl = 60", 1, true), "ttl hunk should now be in fix: logging")
+  eq(mgit({ "rev-parse", "HEAD^{tree}" }), tree)
+  vim.fn.delete(mdir, "rf")
+end)
+
 vim.fn.delete(dir, "rf")
 print(("%d/%d passed"):format(n - fails, n))
 os.exit(fails > 0 and 1 or 0)

@@ -126,6 +126,8 @@ Key     Action           Does ~
 `x`     discard          Discard file, hunk or selected lines
 `a`     absorb           Fold each staged hunk into the unpushed commit that
                          last touched its lines, see |petal-absorb|
+`o`     move_hunk        In a commit view: move the hunk (or file) under the
+                         cursor to another unpushed commit, see |petal-move|
 `d`     diff             Vimdiff of the file vs HEAD
 `e`     merge_mode       Resolve a conflicted file (ours | theirs above)
 <C-r>   refresh          Refresh
@@ -146,6 +148,18 @@ preview lists where each hunk goes before anything is rewritten. Hunks with
 no single unpushed owner (pushed code, lines from two commits, new, deleted,
 renamed, binary or mode-changed files) stay staged. A pure insertion goes to
 the commit that owns the lines around it. The old HEAD is in the reflog.
+
+                                                               *petal-move*
+Move (`o` in a commit view, opened with <CR> on a commit): moves the hunk
+under the cursor, or every hunk of the file under it, out of that commit into
+another unpushed commit or into a new commit right after it (the picker
+offers both). The unpushed commits are replayed in memory with
+`git merge-tree` (git 2.40+): no rebase starts and the worktree and index are
+untouched. HEAD moves only if every commit replays cleanly and the final tree
+is identical to HEAD's, so the end result never changes; otherwise nothing
+does and the message names the commit that would conflict. A commit left
+empty is dropped. Author, date and message are kept. Only changes to
+existing text files move, and only in linear unpushed history.
 
 Log views get the popup keys (`$` to `Z` above) plus goto and help; commit and
 diff views also get the fold keys.

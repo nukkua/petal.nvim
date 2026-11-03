@@ -825,6 +825,7 @@ end
 
 local PR = {}
 local show
+local move_hunk -- defined with absorb; the commit view maps it
 
 function PR.status()
   local spin = progress("PR", "gh pr view")
@@ -1342,8 +1343,15 @@ function show(rev, opts)
       vim.cmd.edit(vim.fn.fnameescape(abs))
       if lnum then pcall(vim.api.nvim_win_set_cursor, 0, { math.max(lnum, 1), 0 }) end
     end
+    local function move()
+      local it, f = cur(), files[cur().vfile or 0]
+      if not (f and base.commit) then return notify("move: put the cursor on a hunk or file of a commit", vim.log.levels.WARN) end
+      if #f.hunks == 0 then return notify("move: " .. f.path .. " has no hunks to move", vim.log.levels.WARN) end
+      move_hunk(base.commit, f, it.hunk and { it.hunk } or f.hunks)
+    end
     M.maps(buf, true, { ["goto"] = go, toggle_fold = function() fold("a") end, open_fold = function() fold("o") end,
-      close_fold = function() fold("c") end, open_all = function() all(true) end, close_all = function() all(false) end })
+      close_fold = function() fold("c") end, open_all = function() all(true) end, close_all = function() all(false) end,
+      move_hunk = move })
   end
   if not opts.diff then
     git({ "log", "-1", "--format=%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%at%x1f%P%x1f%B", rev }, nil, function(r)
@@ -1394,25 +1402,49 @@ end
 -- then one autosquash rebase folds them in. Fixups are built in a temporary index, so the real index
 -- and worktree are untouched until the rebase; what has no single owner stays staged.
 -- ponytail: plain text modifications only (new/deleted/renamed/binary/mode-change files stay staged)
-local function absorb()
-  local st = S.data and S.data.st
-  if not st or st.oid == "(initial)" then return notify("absorb: no commits yet", vim.log.levels.WARN) end
-  local s = state()
-  if s.rebase or s.merge or s.pick or s.revert then return notify("absorb: finish the operation in progress first", vim.log.levels.WARN) end
-  if #st.staged == 0 then return notify("absorb: nothing staged", vim.log.levels.WARN) end
-  local tmp = S.gitdir .. "/petal-absorb-index"
+-- history edits written as straight-line code: fn(run, raw, wait) runs in a coroutine, each git call
+-- yields until it answers. run = stdout or error with git's message, raw = the whole result.
+-- wait(start) pauses on a callback API (a picker): start(resume). Any error ends the job and
+-- removes tmp (the scratch index); HEAD only moves on the job's last write, so nothing is half done
+local function job(name, tmp, fn)
   local co
-  local function resume(...) -- any error ends absorb before HEAD moves (update-ref is the last git write)
+  local function resume(...)
     local ok, err = coroutine.resume(co, ...)
-    if not ok then os.remove(tmp); notify("absorb: " .. tostring(err), vim.log.levels.ERROR) end
+    if not ok then os.remove(tmp); notify(name .. ": " .. tostring(err), vim.log.levels.ERROR) end
   end
-  local function run(args, env, stdin) -- one git call, resumed with its result; failure aborts with git's message
+  local function raw(args, env, stdin)
     git(args, { env = env, stdin = stdin }, resume)
-    local r = coroutine.yield()
+    return coroutine.yield()
+  end
+  local function run(args, env, stdin)
+    local r = raw(args, env, stdin)
     if r.code ~= 0 then error(failure(r), 0) end
     return r.stdout
   end
-  co = coroutine.create(function()
+  -- a picker may answer synchronously, while this coroutine is still running: resume on the next tick
+  local function wait(start)
+    start(function(...) local a = { ... } vim.schedule(function() resume(unpack(a)) end) end)
+    return coroutine.yield()
+  end
+  co = coroutine.create(function() fn(run, raw, wait) os.remove(tmp) end)
+  resume()
+end
+
+-- the guards every history edit shares; returns st or nil (and says why)
+local function editable(name)
+  local st = S.data and S.data.st
+  if not st or st.oid == "(initial)" then return notify(name .. ": no commits yet", vim.log.levels.WARN) end
+  local s = state()
+  if s.rebase or s.merge or s.pick or s.revert then return notify(name .. ": finish the operation in progress first", vim.log.levels.WARN) end
+  return st
+end
+
+local function absorb()
+  local st = editable("absorb")
+  if not st then return end
+  if #st.staged == 0 then return notify("absorb: nothing staged", vim.log.levels.WARN) end
+  local tmp = S.gitdir .. "/petal-absorb-index"
+  job("absorb", tmp, function(run)
     local head = vim.trim(run({ "rev-parse", "HEAD" }))
     -- rewritable = on no remote: pushed history is never rewritten
     local own, list = {}, lines(run({ "rev-list", "HEAD", "--not", "--remotes" }))
@@ -1421,6 +1453,10 @@ local function absorb()
     if vim.trim(run({ "rev-list", "--merges", "HEAD", "--not", "--remotes" })) ~= "" then
       return notify("absorb: unpushed history has merges, a rebase would flatten them", vim.log.levels.WARN)
     end
+    -- blame stops at the unpushed range: older lines show as its boundary (not own, so refused) instead
+    -- of git walking the whole history per file (86ms -> 7ms on a 10k-commit file)
+    local range = vim.split(vim.trim(run({ "rev-list", "--parents", "-n", "1", list[#list] })), " ")[2]
+    range = range and (range .. "..HEAD") or "HEAD"
     local files = parse_files(run({ "diff", "--cached", "-U0", "--no-renames", "--no-color", "--no-ext-diff",
       "--src-prefix=a/", "--dst-prefix=b/" }))
     local groups, by, kept = {}, {}, 0 -- groups in first-seen order; hunk.group = its index
@@ -1431,7 +1467,7 @@ local function absorb()
         kept = kept + math.max(#f.hunks, 1)
       else
         local owner = {}
-        for _, l in ipairs(lines(run({ "blame", "-l", "-s", "HEAD", "--", f.path }))) do owner[#owner + 1] = l:match("^%^?(%x+)") end
+        for _, l in ipairs(lines(run({ "blame", "-l", "-s", range, "--", f.path }))) do owner[#owner + 1] = l:match("^%^?(%x+)") end
         for _, h in ipairs(f.hunks) do
           local c = hunk_owner(h.header, owner, own)
           if not c then
@@ -1479,7 +1515,6 @@ local function absorb()
       local tree = vim.trim(run({ "write-tree" }, env))
       parent = vim.trim(run({ "commit-tree", tree, "-p", parent, "-m", "fixup! " .. g.sha }))
     end
-    os.remove(tmp)
     -- HEAD moves onto the fixups; the real index still holds every staged change, so what wasn't
     -- absorbed is exactly what stays staged
     run({ "update-ref", "-m", "petal: absorb", "HEAD", parent, head })
@@ -1493,7 +1528,100 @@ local function absorb()
         end })
       end })
   end)
-  resume()
+end
+
+-- o in a commit view: move the hunk (or the file's hunks) under the cursor out of that commit into
+-- another unpushed commit, or into a new commit right after it. The unpushed stack is replayed in
+-- memory (merge-tree as cherry-pick, git 2.40+); no rebase, worktree or index is touched, and HEAD
+-- moves only if every commit replays cleanly and the final tree is identical to HEAD's
+-- ponytail: plain text modifications only, linear unpushed history, whole hunks (not single lines)
+move_hunk = function(commit, f, hunks)
+  if not editable("move") then return end
+  if f.mode ~= "M" or f.binary then return notify("move: only changes to existing text files can move", vim.log.levels.WARN) end
+  local p = vim.list_extend({}, f.header)
+  for _, h in ipairs(hunks) do vim.list_extend(p, cat({ h.header }, h.lines)) end
+  local patch = table.concat(p, "\n") .. "\n"
+  local tmp = S.gitdir .. "/petal-move-index"
+  local env = { GIT_INDEX_FILE = tmp }
+  job("move", tmp, function(run, raw, wait)
+    local head = vim.trim(run({ "rev-parse", "HEAD" }))
+    local X = vim.trim(run({ "rev-parse", commit }))
+    -- the unpushed stack, oldest first, with everything the replay needs in one call (not 2 per commit)
+    local chain, pos = {}, {}
+    local log = run({ "log", "--reverse", "--date=raw", "--format=%H%x1f%T%x1f%h %s%x1f%an%x1f%ae%x1f%ad%x1f%B%x1e", "HEAD", "--not", "--remotes" })
+    for rec in vim.gsplit(log, "\30", { plain = true }) do
+      local f = vim.split(rec:gsub("^\n", ""), "\31", { plain = true })
+      if #f >= 7 then
+        chain[#chain + 1] = { sha = f[1], tree = f[2], title = f[3], an = f[4], ae = f[5], ad = f[6], msg = table.concat(vim.list_slice(f, 7), "\31") }
+        pos[f[1]] = #chain
+      end
+    end
+    if not pos[X] then return notify("move: " .. commit .. " is pushed (or not on this branch), it can't be rewritten", vim.log.levels.WARN) end
+    if vim.trim(run({ "rev-list", "--merges", "HEAD", "--not", "--remotes" })) ~= "" then
+      return notify("move: unpushed history has merges", vim.log.levels.WARN)
+    end
+    local NEW = "+ new commit right after " .. chain[pos[X]].title
+    local items = { NEW }
+    for i = #chain, 1, -1 do if i ~= pos[X] then items[#items + 1] = chain[i].title end end
+    local pick_ = wait(function(done) pick("Move " .. #hunks .. " hunk(s) of " .. f.path .. " to", items, done) end)
+    local Y, msg
+    if pick_ == NEW then
+      msg = wait(function(done) input("New commit message: ", nil, done) end)
+    else
+      for _, c in ipairs(chain) do if c.title == pick_ then Y = c.sha end end
+    end
+    local forward = not Y or pos[Y] > pos[X] -- X loses the hunk before it reappears
+    local lo = math.min(pos[X], Y and pos[Y] or pos[X])
+    local parents = vim.split(vim.trim(run({ "rev-list", "--parents", "-n", "1", chain[lo].sha })), " ")
+    if not parents[2] then return notify("move: can't rewrite the root commit", vim.log.levels.WARN) end
+
+    local function patched(tree, reverse, at)
+      run({ "read-tree", tree }, env)
+      local r = raw(cat({ "apply", "--cached" }, reverse and { "-R" } or {}, { "-" }), env, patch)
+      if r.code ~= 0 then error("the hunk doesn't apply on " .. at .. " (it depends on lines from other commits)", 0) end
+      return vim.trim(run({ "write-tree" }, env))
+    end
+    local function commit_tree(tree, parent, c) -- keeps author, date and message; you become committer, as in a rebase
+      return vim.trim(run({ "commit-tree", tree, "-p", parent, "-F", "-" },
+        { GIT_AUTHOR_NAME = c.an, GIT_AUTHOR_EMAIL = c.ae, GIT_AUTHOR_DATE = c.ad }, c.msg))
+    end
+
+    local parent, orig = parents[2], parents[2]
+    local ptree, dropped = vim.trim(run({ "rev-parse", parent .. "^{tree}" })), {}
+    for i = lo, #chain do
+      local c = chain[i]
+      local own_tree = c.tree
+      local tree = own_tree
+      if parent ~= orig then -- parent was rewritten: cherry-pick c onto it, in memory
+        local r = raw({ "merge-tree", "--write-tree", "--merge-base", orig, parent, c.sha })
+        if r.code ~= 0 then error(("moving it makes \"%s\" conflict, nothing changed"):format(c.title), 0) end
+        tree = lines(r.stdout)[1]
+      end
+      if c.sha == X and forward then tree = patched(tree, true, c.title) end
+      if c.sha == Y then tree = patched(tree, false, c.title) end
+      local new
+      if parent == orig and tree == own_tree then
+        new = c.sha -- untouched: reused as is
+      elseif tree == ptree then
+        new, dropped[#dropped + 1] = parent, c.title -- nothing left in it: dropped, as a rebase does
+      else
+        new = commit_tree(tree, parent, c)
+      end
+      if c.sha == X and not Y then
+        tree = patched(tree, false, "the new commit")
+        new = vim.trim(run({ "commit-tree", tree, "-p", new, "-m", msg }))
+      end
+      parent, orig, ptree = new, c.sha, tree
+    end
+    -- moving changes which commit holds the hunk, never the end result
+    if vim.trim(run({ "rev-parse", parent .. "^{tree}" })) ~= vim.trim(run({ "rev-parse", head .. "^{tree}" })) then
+      error("the result would differ from HEAD, nothing changed", 0)
+    end
+    run({ "update-ref", "-m", "petal: move hunk", "HEAD", parent, head })
+    notify(("move: %s → %s, was %s (reflog)%s"):format(f.path, Y and chain[pos[Y]].title:gsub("^%x+ ", "") or msg, head:sub(1, 7),
+      #dropped > 0 and ("\nnow empty, dropped: " .. table.concat(dropped, ", ")) or ""))
+    M.refresh()
+  end)
 end
 
 local function history()
@@ -2318,6 +2446,9 @@ KEYS = {
     { "u", "unstage", "Unstage", with(unstage), true }, { "U", "unstage_all", "Unstage all", unstage_all },
     { "x", "discard", "Discard", with(discard), true },
     { "a", "absorb", "Absorb staged into unpushed commits", absorb },
+    { "o", "move_hunk", "Move hunk to another commit (in a commit view)", function()
+      notify("move: open a commit (<cr> on it), then o on a hunk or file", vim.log.levels.WARN)
+    end },
     { "d", "diff", "Diff mode (against HEAD)", vimdiff }, { "e", "merge_mode", "Merge mode (conflict)", merge_mode },
   } },
   { "Essential commands", {
