@@ -431,8 +431,9 @@ local function paint(buf, L, H)
   -- onto row p, so the redone range always includes it
   local e = math.max(#L - s, p + 1)
   vim.api.nvim_buf_clear_namespace(buf, ns, p, e)
-  for _, h in ipairs(H) do
-    if h[1] >= p and h[1] < e then vim.api.nvim_buf_set_extmark(buf, ns, h[1], h[2], { end_col = h[3], hl_group = h[4] }) end
+  for _, h in ipairs(H) do -- H is in row order
+    if h[1] >= e then break end
+    if h[1] >= p then vim.api.nvim_buf_set_extmark(buf, ns, h[1], h[2], { end_col = h[3], hl_group = h[4] }) end
   end
 end
 
@@ -666,9 +667,11 @@ local function render(focus)
     for hi, h in ipairs(diff.hunks or {}) do
       add({ { h.header, "GitHunkHeader" } }, { section = f.section, file = f, diff = diff, hunk = h, hi = hi, idx = 0 })
       for i, l in ipairs(h.lines) do
-        local c = l:sub(1, 1)
-        add({ { l, c == "+" and "GitDiffAdd" or c == "-" and "GitDiffDelete" or nil } },
-          { section = f.section, file = f, diff = diff, hunk = h, hi = hi, idx = i })
+        -- hot loop (one per diff line): add() inlined, no chunk tables and no sub() string
+        local c, n = l:byte(1), #L
+        local g = c == 43 and "GitDiffAdd" or c == 45 and "GitDiffDelete" or nil -- + -
+        if g then H[#H + 1] = { n, 0, #l, g } end
+        L[n + 1], R[n + 1] = l, { section = f.section, file = f, diff = diff, hunk = h, hi = hi, idx = i }
       end
     end
   end
@@ -689,7 +692,9 @@ local function render(focus)
   S.rows[buf] = R
   if win ~= -1 then
     local row = math.min(cur, #L)
-    for r, it in pairs(R) do if key(it) == want then row = r break end end
+    if key(R[row]) ~= want then -- usually the item hasn't moved: skip a key() per row
+      for r, it in pairs(R) do if key(it) == want then row = r break end end
+    end
     vim.api.nvim_win_set_cursor(win, { row, 0 })
   end
 end
