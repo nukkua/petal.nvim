@@ -215,6 +215,13 @@ it. Git groups are named `Git*` (e.g. `GitSectionHeader`, `GitDiffAdd`), PR
 groups are `PrOpen`, `PrMerged`, `PrClosed`, `PrDraft`, `PrWarn` and
 `PrBranch`.
 
+Messages read `subject: what happened` (e.g. `switch: no previous branch`).
+With the builtin |vim.notify| they are echoed with an icon in
+`GitNotifyError`, `GitNotifyWarn` or `GitNotifyInfo` and the subject in
+`GitNotifySubject`; a notifier plugin gets the same text uncolored. "Nothing
+to do" answers from git (nothing to commit, no stash, no previous branch) are
+warnings, real failures are errors; `$` shows git's full output.
+
 ==============================================================================
 10. HEALTH                                                      *petal-health*
 

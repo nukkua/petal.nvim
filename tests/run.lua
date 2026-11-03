@@ -194,6 +194,26 @@ test("mappings: every action name is unique", function()
   end
 end)
 
+---------------------------------------------------------------- errors
+
+test("failure: real git output -> short message + level", function()
+  local W, E = vim.log.levels.WARN, vim.log.levels.ERROR
+  local function f(cmd)
+    local r = vim.system(cmd, { cwd = dir, text = true }):wait()
+    assert(r.code ~= 0, table.concat(cmd, " ") .. " should fail")
+    return { t.failure(r) }
+  end
+  eq(f({ "git", "switch", "-" }), { "no previous branch", W })
+  eq(f({ "git", "stash", "pop" }), { "no stash entries", W })
+  eq(f({ "git", "push" }), { "no remote configured (M a adds one)", W })
+  write("u.txt", { "u" })
+  eq(f({ "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit" }), { "nothing added to commit but untracked files present", W })
+  vim.fn.delete(dir .. "/u.txt")
+  eq(f({ "git", "switch", "nope" }), { "invalid reference: nope", E })
+  eq(t.failure({ code = 1, stderr = "error: a\nhint: b\nhint: c\n" }), "a")
+  eq(t.failure({ code = 3, stderr = "", stdout = "" }), "exited 3")
+end)
+
 vim.fn.delete(dir, "rf")
 print(("%d/%d passed"):format(n - fails, n))
 os.exit(fails > 0 and 1 or 0)

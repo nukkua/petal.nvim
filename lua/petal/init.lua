@@ -62,6 +62,8 @@ local HL = {
   GitKindNew = "GitChangeAdded", GitKindFix = "GitChangeModified", GitKindMerge = "Special", GitKindBranch = "GitBranch",
   GitKindReset = "GitChangeDeleted", GitKindRewrite = "GitChangeUpdated", GitKindChore = "GitSubtleText",
   GitPopupActionKey = "Special", GitPopupSwitchKey = "Special", GitPopupSwitchEnabled = "String",
+  GitNotifyError = "DiagnosticError", GitNotifyWarn = "DiagnosticWarn", GitNotifyInfo = "DiagnosticInfo",
+  GitNotifySubject = "GitBranch",
 }
 -- GitHub web (Primer): open green, merged purple, closed red, draft gray
 local PR_HL = { PrOpen = "#9ecfa8", PrMerged = "#c3a8d8", PrClosed = "#d98c8c", PrDraft = "#8a8a8a", PrWarn = "#d8b48f", PrBranch = "#ffb6c1" }
@@ -80,12 +82,54 @@ local function cat(...)
   return t
 end
 local function lines(s) return vim.split(s or "", "\n", { plain = true, trimempty = true }) end
--- info goes to fidget (corner, fades out); warnings/errors stay in vim.notify so they're not missed
+-- every message is "subject: what happened", extra lines are detail.
+-- info goes to fidget (corner, fades out); warnings/errors stay in vim.notify so they're not missed.
+-- with the builtin vim.notify they're echoed in color (icon, subject); a notifier plugin gets plain text
+local ICON = { [vim.log.levels.ERROR] = { "✗", "GitNotifyError" }, [vim.log.levels.WARN] = { "▲", "GitNotifyWarn" } }
 local function notify(msg, lvl)
   lvl = lvl or vim.log.levels.INFO
   local ok, fidget = pcall(require, "fidget")
   if ok and lvl <= vim.log.levels.INFO then return fidget.notify(msg, lvl, { annote = "git" }) end
-  vim.notify(msg, lvl, { title = "git" })
+  if not (debug.getinfo(vim.notify, "S").source or ""):match("^@?vim/") then return vim.notify(msg, lvl, { title = "git" }) end
+  local subject, rest = msg:match("^([^%s:]+): (.*)$")
+  local first, detail = (rest or msg):match("^([^\n]*)\n?(.*)$")
+  local icon = ICON[lvl] or { "●", "GitNotifyInfo" }
+  local chunks = { { icon[1] .. " ", icon[2] } }
+  if subject then vim.list_extend(chunks, { { subject, "GitNotifySubject" }, { " " } }) end
+  chunks[#chunks + 1] = { first, "Normal" }
+  if detail ~= "" then chunks[#chunks + 1] = { "\n" .. detail, "GitSubtleText" } end
+  vim.api.nvim_echo(chunks, true, { err = lvl >= vim.log.levels.ERROR })
+end
+
+-- git's "nothing to do" answers: a warning in plain words, not an error
+local QUIET = {
+  { "invalid reference: @{%-1}", "no previous branch" },
+  { "No configured push destination", "no remote configured (M a adds one)" },
+  { "No stash entries found", "no stash entries" },
+  { "^nothing to commit" }, { "^nothing added to commit" }, { "^no changes added to commit" },
+}
+-- failed git/gh result -> message, level: hints and (use …) advice dropped, fatal:/error: stripped,
+-- at most 6 lines (the rest is in history, $). A failure only on stdout ends in its verdict line
+local function failure(r)
+  local stderr = vim.trim(r.stderr or "") ~= ""
+  local out = {}
+  for _, l in ipairs(lines(stderr and r.stderr or r.stdout)) do
+    if not (l:match("^hint:") or l:match("^%s*%(use ")) then
+      l = vim.trim((l:gsub("^fatal: ", ""):gsub("^error: ", ""):gsub("%s*%(use .-%)$", "")))
+      if l ~= "" then out[#out + 1] = l end
+    end
+  end
+  if not stderr then out = { out[#out] } end
+  for _, q in ipairs(QUIET) do
+    for _, l in ipairs(out) do if l:match(q[1]) then return q[2] or l, vim.log.levels.WARN end end
+  end
+  if #out > 6 then out = cat(vim.list_slice(out, 1, 6), { "… full output in history ($)" }) end
+  return #out > 0 and table.concat(out, "\n") or ("exited " .. r.code), vim.log.levels.ERROR
+end
+local function fail(subject, r, spin)
+  if spin then spin("failed") end
+  local msg, lvl = failure(r)
+  notify(subject .. ": " .. msg, lvl)
 end
 -- fidget spinner for slow (network) work; returns done(msg) which ends it showing msg.
 -- without fidget: no spinner, done(msg) is a plain notification
@@ -103,7 +147,7 @@ local function input(prompt, default, cb)
   end)
 end
 local function pick(prompt, items, cb)
-  if #items == 0 then return notify(prompt .. ": nothing to pick", vim.log.levels.WARN) end
+  if #items == 0 then return notify(prompt:lower() .. ": nothing to pick", vim.log.levels.WARN) end
   require("petal.select").select(items, { prompt = prompt, height = C.height }, function(c) if c then cb(c) end end)
 end
 
@@ -165,8 +209,7 @@ local function act(args, opts)
     git(args, { log = true, raw = opts.raw, stdin = opts.stdin, env = opts.env }, function(r)
       local out = vim.trim((r.stdout or "") .. "\n" .. (r.stderr or ""))
       if r.code ~= 0 then
-        if spin then spin("failed") end
-        notify(out ~= "" and out or ("git exited " .. r.code), vim.log.levels.ERROR)
+        fail(args and args[1] or (opts.raw[#opts.raw]:match("^git%s+([%w-]+)")) or "git", r, spin)
       elseif spin and opts.show and out ~= "" and #lines(out) <= 8 then
         spin(out) -- short output becomes the spinner's success message
       else
@@ -221,7 +264,7 @@ local function fetch_bg(cb)
     for _, f in ipairs(cbs) do f() end
   end
   if F.job then
-    if cb then notify("waiting for fetch…") end
+    if cb then notify("fetch: waiting for the running fetch…") end
     return
   end
   if vim.uv.now() - F.at < FETCH_TTL then return flush() end
@@ -245,7 +288,7 @@ end
 
 local function remote(cb)
   local rs = S.data and S.data.remotes or {}
-  if #rs == 0 then return notify("no remotes (M a adds one)", vim.log.levels.WARN) end
+  if #rs == 0 then return notify("remote: none configured (M a adds one)", vim.log.levels.WARN) end
   if #rs == 1 or vim.tbl_contains(rs, "origin") then return cb(#rs == 1 and rs[1] or "origin") end
   pick("Remote", rs, cb)
 end
@@ -737,7 +780,7 @@ local function pr_pick(prompt, cb)
   local spin = progress("PRs", "gh pr list")
   gh({ "pr", "list", "--limit", "30", "--json", "number,title,author,headRefName,isDraft,state,reviewDecision,statusCheckRollup,url" }, {}, function(r)
     local prs = json(r)
-    if r.code ~= 0 then spin("failed") return notify(r.stderr, vim.log.levels.ERROR) end
+    if r.code ~= 0 then return fail("pr", r, spin) end
     spin(prs and #prs > 0 and (#prs .. " PRs") or "no PRs")
     if not prs or #prs == 0 then return end
     require("petal.select").select(prs, { prompt = prompt, height = C.height, format_item = function(pr)
@@ -756,7 +799,7 @@ end
 function PR.list()
   pr_pick("PRs", function(pr)
     vim.fn.setreg("+", str(pr.url))
-    notify("PR URL copied:\n" .. str(pr.url))
+    notify("pr: url copied\n" .. str(pr.url))
   end)
 end
 
@@ -773,7 +816,7 @@ function PR.checks()
   local spin = progress("PR", "gh pr checks")
   gh({ "pr", "checks", "--json", "name,workflow,bucket,link" }, {}, function(r)
     local cs = json(r) -- exit code is non-zero whenever a check fails or is pending
-    if not cs then spin("failed") return notify(vim.trim(r.stderr or ""), vim.log.levels.ERROR) end
+    if not cs then return fail("pr", r, spin) end
     spin(#cs .. " checks")
     if #cs == 0 then return end
     local function rank(c) return c.bucket == "fail" and 0 or c.bucket == "pending" and 1 or 2 end
@@ -792,7 +835,7 @@ function PR.checks()
       end
       local lspin = progress("CI", "gh run view --log-failed")
       gh(cat({ "run", "view" }, job and { "--job", job } or { run }, { "--log-failed" }), {}, function(lr)
-        if lr.code ~= 0 then lspin("failed") return notify(vim.trim(lr.stderr or ""), vim.log.levels.ERROR) end
+        if lr.code ~= 0 then return fail("ci", lr, lspin) end
         if vim.trim(lr.stdout or "") == "" then
           lspin("no log yet, opening the page")
           return vim.ui.open(link)
@@ -823,7 +866,7 @@ function PR.create()
       S.pr_at = {}
       -- gh fails with "a pull request for branch ... already exists:\n<url>"
       local existing = r.code ~= 0 and (r.stderr or ""):match("already exists:%s*(https://%S+)")
-      if r.code ~= 0 and not existing then spin("failed") return notify(r.stderr, vim.log.levels.ERROR) end
+      if r.code ~= 0 and not existing then return fail("pr", r, spin) end
       local url = existing or vim.trim(r.stdout)
       vim.fn.setreg("+", url)
       spin((existing and "PR already exists" or "PR created") .. ", URL copied: " .. url)
@@ -835,7 +878,7 @@ end
 function PR.open()
   local spin = progress("PR", "gh pr view")
   gh({ "pr", "view", "--json", "url", "--jq", ".url" }, {}, function(r)
-    if r.code ~= 0 then spin("failed") return notify(r.stderr, vim.log.levels.ERROR) end
+    if r.code ~= 0 then return fail("pr", r, spin) end
     local url = vim.trim(r.stdout)
     vim.fn.setreg("+", url)
     vim.ui.open(url)
@@ -852,7 +895,7 @@ function PR.close()
   local spin = progress("PR", "gh pr close")
   gh({ "pr", "close" }, { log = true }, function(r)
     S.pr_at = {}
-    if r.code ~= 0 then spin("failed") return notify(r.stderr, vim.log.levels.ERROR) end
+    if r.code ~= 0 then return fail("pr", r, spin) end
     spin("PR closed")
     M.refresh()
   end)
@@ -1029,10 +1072,10 @@ local function discard(ctx)
       local dst = trash .. "/" .. f.path:gsub("/$", "")
       vim.fn.mkdir(vim.fs.dirname(dst), "p")
       local ok, err = os.rename(S.root .. "/" .. f.path:gsub("/$", ""), dst)
-      if ok then moved = moved + 1 else notify("kept " .. f.path .. ": " .. tostring(err), vim.log.levels.ERROR) end
+      if ok then moved = moved + 1 else notify("discard: kept " .. f.path .. "\n" .. tostring(err), vim.log.levels.ERROR) end
     end
   end
-  if moved > 0 then notify(("moved %d untracked to %s"):format(moved, vim.fn.fnamemodify(trash, ":~:."))) end
+  if moved > 0 then notify(("discard: moved %d untracked to %s"):format(moved, vim.fn.fnamemodify(trash, ":~:."))) end
   local tracked = vim.tbl_filter(function(f) return f.section ~= "untracked" end, fs)
   if #tracked == 0 then return M.refresh() end
   backup(function()
@@ -1098,9 +1141,9 @@ function show(rev, opts)
     end
     if opts.diff then
       if not files then return end
-      if #files == 0 then return notify(rev .. ": no changes") end
+      if #files == 0 then return notify("diff: no changes in " .. rev) end
     elseif not hdr then
-      return notify(rev .. ": not found", vim.log.levels.WARN)
+      return notify("show: " .. rev .. " not found", vim.log.levels.WARN)
     end
     local buf = scratch((opts.stash and "stash " or opts.diff and "diff " or "show ") .. rev, "GitCommit", {})
     local total, open = 0, {}
@@ -1199,7 +1242,7 @@ function show(rev, opts)
       local f = it.vfile and files[it.vfile]
       if not f then return end
       local abs = S.root .. "/" .. f.path
-      if vim.fn.filereadable(abs) == 0 then return notify(f.path .. " no longer exists in the worktree", vim.log.levels.WARN) end
+      if vim.fn.filereadable(abs) == 0 then return notify("goto: " .. f.path .. " no longer exists in the worktree", vim.log.levels.WARN) end
       local lnum
       if it.hunk then
         lnum = it.hunk.new
@@ -1228,8 +1271,7 @@ function show(rev, opts)
   git(nil, { raw = opts.diff or (opts.stash and { "git", "stash", "show", "-p", "--include-untracked", rev })
     or { "git", "show", "--format=", "--patch", "--diff-merges=first-parent", rev } }, function(r)
     if opts.diff and r.code ~= 0 then
-      if spin then spin("failed") end
-      notify(vim.trim(r.stderr or "") ~= "" and vim.trim(r.stderr) or (rev .. ": diff failed"), vim.log.levels.ERROR)
+      fail("diff", r, spin)
     else
       if spin then spin() end
       files = parse_files(r.stdout)
@@ -1345,7 +1387,7 @@ end
 local function merge_mode()
   local it = (S.rows[S.buf] or {})[vim.fn.line(".")]
   local f = it and it.file
-  if not (f and f.mode == "U") then return notify("not a conflicted file", vim.log.levels.WARN) end
+  if not (f and f.mode == "U") then return notify("merge: not a conflicted file", vim.log.levels.WARN) end
   local rel, abs = f.path, S.root .. "/" .. f.path
   local line = it.conflict and it.conflict.line
   vim.cmd.tabnew(vim.fn.fnameescape(abs))
@@ -1393,7 +1435,7 @@ local function merge_mode()
         return jump(1)
       end
     end
-    notify("cursor is not inside a conflict", vim.log.levels.WARN)
+    notify("merge: cursor is not inside a conflict", vim.log.levels.WARN)
   end
   local function done()
     if vim.bo[mbuf].modified then vim.api.nvim_buf_call(mbuf, function() vim.cmd("silent write") end) end
@@ -1403,9 +1445,9 @@ local function merge_mode()
     for _, k in ipairs({ "co", "ct", "cb", "c0", "]c", "[c", "q" }) do pcall(vim.keymap.del, "n", k, { buffer = mbuf }) end
     vim.cmd("diffoff! | tabclose")
     if left == 0 then
-      act({ "add", "--", rel }, { after = function() notify(rel .. ": resolved and staged") end })
+      act({ "add", "--", rel }, { after = function() notify("merge: " .. rel .. " resolved and staged") end })
     else
-      notify(("%s: %d conflict(s) left"):format(rel, left), vim.log.levels.WARN)
+      notify(("merge: %s has %d conflict(s) left"):format(rel, left), vim.log.levels.WARN)
       M.refresh()
     end
   end
@@ -1422,7 +1464,7 @@ end
 
 local function log_view(args, name, file)
   git(args, nil, function(r)
-    if vim.trim(r.stdout or "") == "" then return notify(name .. ": no history", vim.log.levels.WARN) end
+    if vim.trim(r.stdout or "") == "" then return notify("log: " .. name .. " has no history", vim.log.levels.WARN) end
     local add, L, H, R = builder()
     local list = parse_log(r.stdout)
     if name == "reflog" then reflog_rows(list) end
@@ -1445,11 +1487,11 @@ end
 -- ponytail: untracked files have no HEAD to diff, so they warn
 local function vimdiff()
   local it = (S.rows[S.buf] or {})[vim.fn.line(".")]
-  if not (it and it.file) then return notify("no file under cursor", vim.log.levels.WARN) end
+  if not (it and it.file) then return notify("diff: no file under cursor", vim.log.levels.WARN) end
   if it.file.mode == "U" then return merge_mode() end -- HEAD alone says nothing about a conflict
   local root, rel = S.root, it.file.path
   vim.fn.system({ "git", "-C", root, "cat-file", "-e", "HEAD:" .. rel })
-  if vim.v.shell_error ~= 0 then return notify("untracked: nothing in HEAD to diff", vim.log.levels.WARN) end
+  if vim.v.shell_error ~= 0 then return notify("diff: untracked, nothing in HEAD to diff against", vim.log.levels.WARN) end
   -- ponytail: one diff at a time; repeat-d replaces instead of stacking splits
   vim.cmd("diffoff!")
   for _, b in ipairs(vim.api.nvim_list_bufs()) do
@@ -1903,7 +1945,7 @@ function P.log()
         local name = vim.api.nvim_buf_get_name(S.prev)
         if vim.startswith(name, S.root .. "/") then path = name:sub(#S.root + 2) end
       end
-      if not path then return notify("no file under cursor or in the previous buffer", vim.log.levels.WARN) end
+      if not path then return notify("log: no file under cursor or in the previous buffer", vim.log.levels.WARN) end
       log_view({ "log", "--follow", "-n", "256", f, "--", path }, "log " .. path, path)
     end },
     -- every place HEAD has been: the undo list for rebase/reset/amend. %gs = what moved it,
@@ -2023,7 +2065,7 @@ local function bindings()
         if k[2] == name then table.insert(BIND[gi][2], { key, k[2], k[3], k[4], k[5] }) end
       end
     elseif name ~= false then
-      notify(("mappings[%q]: unknown action %q (see :h petal-actions)"):format(key, tostring(name)), vim.log.levels.WARN)
+      notify(("mappings: %q has unknown action %q (see :h petal-actions)"):format(key, tostring(name)), vim.log.levels.WARN)
     end
   end
   return BIND
@@ -2152,11 +2194,11 @@ local function suggest(buf, diff)
   local function accept(commit)
     if not msg then
       want = commit and "commit" or true
-      return notify(job and "still thinking, it goes in when ready" or "no suggestion")
+      return notify(job and "suggest: still thinking, it goes in when ready" or "suggest: no suggestion")
     end
     local stop = region()
     if commit and vim.trim(table.concat(vim.api.nvim_buf_get_lines(buf, 0, stop, false), "")) ~= "" then
-      return notify("message already written: <c-c><c-c> commits it", vim.log.levels.WARN) -- never overwrite typed text
+      return notify("suggest: message already written, <c-c><c-c> commits it", vim.log.levels.WARN) -- never overwrite typed text
     end
     vim.api.nvim_buf_clear_namespace(buf, gns, 0, -1)
     vim.api.nvim_buf_set_lines(buf, 0, stop, false, stop < vim.api.nvim_buf_line_count(buf) and cat(msg, { "" }) or msg)
@@ -2172,7 +2214,7 @@ local function suggest(buf, diff)
     job = vim.system(C.commit_suggest, { stdin = d.stdout, text = true, cwd = S.root }, vim.schedule_wrap(function(r)
       job = nil
       if not vim.api.nvim_buf_is_valid(buf) then return spin("cancelled") end
-      if r.code ~= 0 then spin("failed") return notify(vim.trim(r.stderr or ""), vim.log.levels.ERROR) end
+      if r.code ~= 0 then return fail("suggest", r, spin) end
       msg = lines(vim.trim((r.stdout or ""):gsub("^%s*```%w*\n", ""):gsub("\n```%s*$", ""))) -- models like fences
       if #msg == 0 then msg = nil return spin("empty suggestion") end
       spin("ready: <c-c><c-s> accepts, <c-c><c-y> commits")
@@ -2240,7 +2282,7 @@ M._t = {
     return t
   end,
   bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, parse_conflicts = parse_conflicts,
-  parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary,
+  parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary, failure = failure,
 }
 
 return M
