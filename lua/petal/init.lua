@@ -132,11 +132,11 @@ local function fail(subject, r, spin)
   notify(subject .. ": " .. msg, lvl)
 end
 -- fidget spinner for slow (network) work; returns done(msg) which ends it showing msg.
--- without fidget: no spinner, done(msg) is a plain notification
-local function progress(title, msg)
+-- without fidget: no spinner, done(msg) is a plain notification. client: the group fidget shows it under
+local function progress(title, msg, client)
   local ok, fp = pcall(require, "fidget.progress")
   if not ok then return function(final) notify(title .. ": " .. (final or "done")) end end
-  local h = fp.handle.create({ title = title, message = msg, lsp_client = { name = "git" } })
+  local h = fp.handle.create({ title = title, message = msg, lsp_client = { name = client or "git" } })
   return function(final) h.message = final or "done" h:finish() end
 end
 local function confirm(msg) return vim.fn.confirm(msg, "&Yes\n&No", 2) == 1 end
@@ -2223,7 +2223,8 @@ end
 local function suggest(buf, diff)
   local gns = vim.api.nvim_create_namespace("petal.suggest")
   local msg, want, job
-  local spin = progress("Commit", "suggesting message")
+  local tool = vim.fs.basename(C.commit_suggest[1]) -- "claude", "pi": who is thinking, not "git"
+  local spin = progress("Commit", "suggesting message", tool)
   local function region() -- message lines = everything above the first # comment
     for i, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
       if l:match("^#") then return i - 1 end
@@ -2263,7 +2264,7 @@ local function suggest(buf, diff)
     job = vim.system(C.commit_suggest, { stdin = d.stdout, text = true, cwd = S.root }, vim.schedule_wrap(function(r)
       job = nil
       if not vim.api.nvim_buf_is_valid(buf) then return spin("cancelled") end
-      if r.code ~= 0 then return fail("suggest", r, spin) end
+      if r.code ~= 0 then return fail(tool, r, spin) end
       msg = lines(vim.trim((r.stdout or ""):gsub("^%s*```%w*\n", ""):gsub("\n```%s*$", ""))) -- models like fences
       if #msg == 0 then msg = nil return spin("empty suggestion") end
       spin("ready: <c-c><c-s> accepts, <c-c><c-y> commits")
