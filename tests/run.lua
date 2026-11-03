@@ -195,6 +195,17 @@ test("parse_merge_tree: conflicts, clean, missing ref", function()
   git({ "branch", "-qD", "radar" })
 end)
 
+test("hunk_owner: single unpushed owner or nothing", function()
+  local owner, own = { "c1", "c1", "c2", "c2", "pushed" }, { c1 = 1, c2 = 2 }
+  eq(t.hunk_owner("@@ -1,2 +1,2 @@", owner, own), "c1")      -- both replaced lines are c1's
+  eq(t.hunk_owner("@@ -3 +3 @@", owner, own), "c2")          -- no count = 1 line
+  eq(t.hunk_owner("@@ -2,2 +2,2 @@", owner, own), nil)       -- c1 and c2: ambiguous
+  eq(t.hunk_owner("@@ -5 +5 @@", owner, own), nil)           -- pushed commit: never rewritten
+  eq(t.hunk_owner("@@ -3,0 +4 @@", owner, own), "c2")        -- insert between c2 lines 3 and 4
+  eq(t.hunk_owner("@@ -2,0 +3 @@", owner, own), nil)         -- insert between c1 and c2
+  eq(t.hunk_owner("@@ -0,0 +1 @@", owner, own), "c1")        -- insert at the top: line 1 decides
+end)
+
 ---------------------------------------------------------------- mappings
 
 test("mappings: default, drop, add, rebind", function()

@@ -1371,6 +1371,131 @@ function show(rev, opts)
   end)
 end
 
+---------------------------------------------------------------- absorb
+
+-- the commit a -U0 hunk belongs to: every old line it replaces was last changed by the same own commit.
+-- A pure insertion (-a,0) has no old lines: the lines around it (a, a+1) decide. owner[n] = sha of line n
+-- in HEAD, own[sha] = rewritable. nil = no single owner, the hunk stays staged
+local function hunk_owner(header, owner, own)
+  local a, b = header:match("^@@ %-(%d+),?(%d*)")
+  a, b = tonumber(a), b == "" and 1 or tonumber(b)
+  local from, to = a, a + b - 1
+  if b == 0 then from, to = math.max(a, 1), math.min(a + 1, #owner) end
+  local c
+  for n = from, to do
+    local o = owner[n]
+    if not (o and own[o]) or (c and o ~= c) then return nil end
+    c = o
+  end
+  return c
+end
+
+-- a: each staged hunk becomes a fixup of the unpushed commit that last touched its lines (git blame),
+-- then one autosquash rebase folds them in. Fixups are built in a temporary index, so the real index
+-- and worktree are untouched until the rebase; what has no single owner stays staged.
+-- ponytail: plain text modifications only (new/deleted/renamed/binary/mode-change files stay staged)
+local function absorb()
+  local st = S.data and S.data.st
+  if not st or st.oid == "(initial)" then return notify("absorb: no commits yet", vim.log.levels.WARN) end
+  local s = state()
+  if s.rebase or s.merge or s.pick or s.revert then return notify("absorb: finish the operation in progress first", vim.log.levels.WARN) end
+  if #st.staged == 0 then return notify("absorb: nothing staged", vim.log.levels.WARN) end
+  local tmp = S.gitdir .. "/petal-absorb-index"
+  local co
+  local function resume(...) -- any error ends absorb before HEAD moves (update-ref is the last git write)
+    local ok, err = coroutine.resume(co, ...)
+    if not ok then os.remove(tmp); notify("absorb: " .. tostring(err), vim.log.levels.ERROR) end
+  end
+  local function run(args, env, stdin) -- one git call, resumed with its result; failure aborts with git's message
+    git(args, { env = env, stdin = stdin }, resume)
+    local r = coroutine.yield()
+    if r.code ~= 0 then error(failure(r), 0) end
+    return r.stdout
+  end
+  co = coroutine.create(function()
+    local head = vim.trim(run({ "rev-parse", "HEAD" }))
+    -- rewritable = on no remote: pushed history is never rewritten
+    local own, list = {}, lines(run({ "rev-list", "HEAD", "--not", "--remotes" }))
+    for i, c in ipairs(list) do own[c] = i end -- i: 1 = newest
+    if #list == 0 then return notify("absorb: every commit is pushed, nothing to absorb into", vim.log.levels.WARN) end
+    if vim.trim(run({ "rev-list", "--merges", "HEAD", "--not", "--remotes" })) ~= "" then
+      return notify("absorb: unpushed history has merges, a rebase would flatten them", vim.log.levels.WARN)
+    end
+    local files = parse_files(run({ "diff", "--cached", "-U0", "--no-renames", "--no-color", "--no-ext-diff",
+      "--src-prefix=a/", "--dst-prefix=b/" }))
+    local groups, by, kept = {}, {}, 0 -- groups in first-seen order; hunk.group = its index
+    for _, f in ipairs(files) do
+      local plain = f.mode == "M" and not f.binary
+      for _, l in ipairs(f.header) do if l:match("^old mode") then plain = false end end
+      if not plain then
+        kept = kept + math.max(#f.hunks, 1)
+      else
+        local owner = {}
+        for _, l in ipairs(lines(run({ "blame", "-l", "-s", "HEAD", "--", f.path }))) do owner[#owner + 1] = l:match("^%^?(%x+)") end
+        for _, h in ipairs(f.hunks) do
+          local c = hunk_owner(h.header, owner, own)
+          if not c then
+            kept = kept + 1
+          else
+            if not by[c] then
+              by[c] = { sha = c, files = {}, n = 0 }
+              groups[#groups + 1] = by[c]
+              by[c].i = #groups
+            end
+            h.group, h.sha, by[c].n = by[c].i, c, by[c].n + 1
+            by[c].files[f.path] = true
+          end
+        end
+      end
+    end
+    if #groups == 0 then return notify(("absorb: no staged hunk has a single unpushed owner (%d stay staged)"):format(kept), vim.log.levels.WARN) end
+
+    -- oldest first, as in the rebase todo; tree building only needs some fixed order
+    table.sort(groups, function(x, y) return own[x.sha] > own[y.sha] end)
+    for i, g in ipairs(groups) do g.i = i end
+    for _, f in ipairs(files) do for _, h in ipairs(f.hunks) do if h.group then h.group = by[h.sha].i end end end
+    local preview = {}
+    for _, g in ipairs(groups) do
+      g.subject = vim.trim(run({ "log", "-1", "--format=%h %s", g.sha }))
+      preview[#preview + 1] = ("%s  ← %d hunk%s in %s"):format(g.subject, g.n, g.n > 1 and "s" or "", table.concat(vim.tbl_keys(g.files), ", "))
+    end
+    if kept > 0 then preview[#preview + 1] = kept == 1 and "1 hunk stays staged (no single unpushed owner)"
+      or (kept .. " hunks stay staged (no single unpushed owner)") end
+    if not confirm("Absorb into " .. #groups .. " commit(s)?\n" .. table.concat(preview, "\n")) then return end
+
+    -- fixup i's tree = HEAD + groups 1..i: every patch is relative to HEAD, so no line offsets shift
+    local env, parent = { GIT_INDEX_FILE = tmp }, head
+    for i, g in ipairs(groups) do
+      local p = {}
+      for _, f in ipairs(files) do
+        local hs = vim.tbl_filter(function(h) return h.group and h.group <= i end, f.hunks)
+        if #hs > 0 then
+          vim.list_extend(p, f.header)
+          for _, h in ipairs(hs) do vim.list_extend(p, cat({ h.header }, h.lines)) end
+        end
+      end
+      run({ "read-tree", head }, env)
+      run({ "apply", "--cached", "--unidiff-zero", "-" }, env, table.concat(p, "\n") .. "\n")
+      local tree = vim.trim(run({ "write-tree" }, env))
+      parent = vim.trim(run({ "commit-tree", tree, "-p", parent, "-m", "fixup! " .. g.sha }))
+    end
+    os.remove(tmp)
+    -- HEAD moves onto the fixups; the real index still holds every staged change, so what wasn't
+    -- absorbed is exactly what stays staged
+    run({ "update-ref", "-m", "petal: absorb", "HEAD", parent, head })
+    -- --autostash brings staged changes back unstaged; autosquash keeps HEAD's final tree, so the
+    -- saved index tree is still exactly what was staged
+    local index = vim.trim(run({ "write-tree" }))
+    act({ "rebase", "-i", "--autosquash", "--autostash", base_of(groups[1].sha) }, { env = { GIT_SEQUENCE_EDITOR = "true" },
+      after = function()
+        act({ "read-tree", index }, { after = function()
+          notify(("absorb: %d commit(s) fixed up, was %s (reflog)"):format(#groups, head:sub(1, 7)))
+        end })
+      end })
+  end)
+  resume()
+end
+
 local function history()
   local L = {}
   for _, h in ipairs(S.history) do
@@ -2192,6 +2317,7 @@ KEYS = {
     { "S", "stage_unstaged", "Stage unstaged", function() act({ "add", "-u" }) end },
     { "u", "unstage", "Unstage", with(unstage), true }, { "U", "unstage_all", "Unstage all", unstage_all },
     { "x", "discard", "Discard", with(discard), true },
+    { "a", "absorb", "Absorb staged into unpushed commits", absorb },
     { "d", "diff", "Diff mode (against HEAD)", vimdiff }, { "e", "merge_mode", "Merge mode (conflict)", merge_mode },
   } },
   { "Essential commands", {
@@ -2381,7 +2507,7 @@ M._t = {
     for _, g in ipairs(KEYS) do for _, k in ipairs(g[2]) do t[k[2]] = true end end
     return t
   end,
-  bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, parse_conflicts = parse_conflicts,
+  bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, hunk_owner = hunk_owner, parse_conflicts = parse_conflicts,
   parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary, failure = failure,
 }
 

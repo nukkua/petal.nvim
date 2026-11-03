@@ -124,6 +124,8 @@ Key     Action           Does ~
 `u`     unstage          Unstage file, hunk or selected lines
 `U`     unstage_all      Unstage everything
 `x`     discard          Discard file, hunk or selected lines
+`a`     absorb           Fold each staged hunk into the unpushed commit that
+                         last touched its lines, see |petal-absorb|
 `d`     diff             Vimdiff of the file vs HEAD
 `e`     merge_mode       Resolve a conflicted file (ours | theirs above)
 <C-r>   refresh          Refresh
@@ -135,6 +137,15 @@ Key     Action           Does ~
 `zM`    close_all        Close all
 `?`     help             Help popup
 `q`     close            Close the status
+
+                                                             *petal-absorb*
+Absorb (`a`) blames the lines of every staged hunk. When they were all last
+changed by one commit that is on no remote, the hunk becomes a `fixup!` of
+it; then one `rebase -i --autosquash --autostash` folds the fixups in. A
+preview lists where each hunk goes before anything is rewritten. Hunks with
+no single unpushed owner (pushed code, lines from two commits, new, deleted,
+renamed, binary or mode-changed files) stay staged. A pure insertion goes to
+the commit that owns the lines around it. The old HEAD is in the reflog.
 
 Log views get the popup keys (`$` to `Z` above) plus goto and help; commit and
 diff views also get the fold keys.
