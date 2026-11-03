@@ -181,6 +181,20 @@ test("split_diff: batched diff matches per-file diffs", function()
   git({ "reset", "-q", "--hard" })
 end)
 
+test("parse_merge_tree: conflicts, clean, missing ref", function()
+  write("r.txt", { "base" }); git({ "add", "r.txt" }); git({ "commit", "-qm", "radar base" })
+  git({ "switch", "-qc", "radar" }); write("r.txt", { "ours" }); git({ "commit", "-qam", "ours" })
+  git({ "switch", "-q", "-" }); write("r.txt", { "theirs" }); git({ "commit", "-qam", "theirs" })
+  local function mt(a, b)
+    local r = vim.system({ "git", "merge-tree", "--write-tree", "--name-only", "--no-messages", a, b }, { cwd = dir, text = true }):wait()
+    return t.parse_merge_tree(r)
+  end
+  eq(mt("radar", "HEAD"), { "r.txt" })
+  eq(mt("radar", "radar~1"), nil) -- ancestor: clean
+  eq(mt("radar", "nope"), nil)    -- exit 1 too, but no tree oid: not a conflict
+  git({ "branch", "-qD", "radar" })
+end)
+
 ---------------------------------------------------------------- mappings
 
 test("mappings: default, drop, add, rebind", function()

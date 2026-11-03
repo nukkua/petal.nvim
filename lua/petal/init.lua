@@ -30,6 +30,7 @@ local S = {
   fetch = { job = false, at = -math.huge, cbs = {} },
   pr = nil,                          -- "root\0branch" -> PR lines; gh takes seconds, so paint from this disk cache
   pr_at = {},                        -- "root\0branch" -> last gh call (ms); gh runs at most every PR_TTL
+  base = nil,                        -- integration branch the conflict radar checks (find_base, cached per repo)
   queue = {},                        -- serialized index/worktree commands, head is running
   seq = 0,                           -- refresh generation: stale async results are dropped
 }
@@ -608,6 +609,12 @@ local function render(focus)
   end
   local pr = S.pr[S.root .. "\0" .. head] or (HAS_GH and #d.remotes > 0 and { { { "loading…", "Comment" } } })
   for i, chunks in ipairs(pr or {}) do add(cat({ { i == 1 and "PR:       " or "          ", sub } }, chunks)) end
+  for _, x in ipairs(d.radar or {}) do
+    local fs = x.files
+    local names = table.concat(vim.list_slice(fs, 1, 3), ", ") .. (#fs > 3 and (" +" .. (#fs - 3)) or "")
+    add({ { "Conflict: ", sub }, { x.target, "GitRemote" }, { (" · %d file%s · "):format(#fs, #fs > 1 and "s" or ""), sub },
+      { names, "GitChangeUnmerged" } })
+  end
   local busy, s = {}, state()
   for _, b in ipairs(BUSY) do if s[b[1]] then busy[#busy + 1] = b[2] end end
   if #busy > 0 then add({ { "State:    ", sub }, { table.concat(busy, ", ") .. " in progress", "GitChangeUnmerged" } }) end
@@ -775,6 +782,47 @@ local function pr_line(branch)
   end)
 end
 
+-- conflict radar: would merging the upstream / base branch into HEAD conflict, and where?
+-- merge-tree does the whole merge in memory (git 2.38+): no worktree, index or refs touched.
+-- out = list of conflicted paths, or nil (clean, missing ref, old git)
+local function parse_merge_tree(r)
+  local l = lines(r.stdout)
+  -- exit 1 is also "not something we can merge"; only a conflict prints the tree oid first
+  if r.code == 1 and (l[1] or ""):match("^%x+$") and #l > 1 then return vim.list_slice(l, 2) end
+end
+
+-- ponytail: checks a merge, not a replayed rebase (a rebase can conflict per commit where the merge
+-- doesn't), and ignores uncommitted changes; a per-commit replay would be the upgrade
+local function radar(d)
+  local st, seq, out, pending = d.st, S.seq, {}, 1
+  if not st.oid or st.oid == "(initial)" then return end
+  local function done()
+    pending = pending - 1
+    if pending > 0 or seq ~= S.seq then return end
+    table.sort(out, function(a, b) return a.target < b.target end)
+    if vim.deep_equal(out, d.radar or {}) then return end -- the common case: no extra render
+    d.radar = out
+    render()
+  end
+  local function check(target)
+    pending = pending + 1
+    git({ "merge-tree", "--write-tree", "--name-only", "--no-messages", "HEAD", target }, nil, function(r)
+      local fs = parse_merge_tree(r)
+      if fs then out[#out + 1] = { target = target, files = fs } end
+      done()
+    end)
+  end
+  -- only behind or only ahead is a fast-forward: nothing to conflict
+  if st.upstream and #d.unpulled > 0 and #d.unpushed > 0 then check(st.upstream) end
+  if #d.remotes == 0 then return done() end
+  local function base(b)
+    S.base = b
+    if b ~= st.upstream then check(b) end
+    done()
+  end
+  if S.base then base(S.base) else find_base(base) end
+end
+
 local PR = {}
 local show
 
@@ -934,9 +982,11 @@ function M.refresh()
       fn(r)
       pending = pending - 1
       if pending > 0 then return end
+      d.radar = S.data and S.data.radar -- shown until the new check answers: no flicker
       S.data, S.diffs = d, diffs
       render()
       if #d.remotes > 0 then pr_line(d.st.head) end
+      radar(d)
     end)
   end
   local function ok(r) return r.code == 0 and vim.trim(r.stdout) or nil end
@@ -2181,7 +2231,7 @@ function M.open()
     root, gitdir = cwd, cwd .. "/.git"
   end
   if root ~= S.root then
-    S.open, S.diffs, S.data, S.fetch.at = {}, {}, nil, -math.huge
+    S.open, S.diffs, S.data, S.fetch.at, S.base = {}, {}, nil, -math.huge, nil
   end
   S.root, S.gitdir = root, gitdir
   S.pr_at = {} -- opening always rechecks the PR
@@ -2331,7 +2381,7 @@ M._t = {
     for _, g in ipairs(KEYS) do for _, k in ipairs(g[2]) do t[k[2]] = true end end
     return t
   end,
-  bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_conflicts = parse_conflicts,
+  bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, parse_conflicts = parse_conflicts,
   parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary, failure = failure,
 }
 

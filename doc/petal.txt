@@ -49,7 +49,14 @@ reviewers                                              *petal-opt-reviewers*
 
 base_branches                                      *petal-opt-base_branches*
   Tried in order to find the integration branch, used by the "merged into"
-  PR line and by |petal-diff| "Branch vs base". Falls back to `origin/HEAD`.
+  PR line, by |petal-diff| "Branch vs base" and by the conflict radar.
+  Falls back to `origin/HEAD`.
+
+  Conflict radar: on each refresh the status header gets a `Conflict:` line
+  for the upstream (when diverged) and the base branch if merging it into
+  HEAD would conflict, with the files. It runs `git merge-tree --write-tree`
+  (git 2.38+), an in-memory merge that touches nothing. It checks a merge,
+  not a rebase, and ignores uncommitted changes. Clean: no line.
 
 recent                                                    *petal-opt-recent*
   Number of commits in the "Recent commits" section.
