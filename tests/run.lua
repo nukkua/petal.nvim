@@ -261,7 +261,10 @@ test("move_hunk: hunk moves to a later commit, end result unchanged", function()
   local L = {}
   for i = 1, 12 do L[i] = "line " .. i end
   local function set(i, v) L[i] = v vim.fn.writefile(L, mdir .. "/app.lua") end
-  mgit({ "init", "-q", "-b", "main" }); set(1, "line 1"); mgit({ "add", "." }); mgit({ "commit", "-qm", "base" })
+  mgit({ "init", "-q", "-b", "main" })
+  -- in the repo's own config, not -c: petal's commit-tree calls must see it too (CI has no global identity)
+  for k, v in pairs({ ["user.name"] = "t", ["user.email"] = "t@t", ["commit.gpgsign"] = "false" }) do mgit({ "config", k, v }) end
+  set(1, "line 1"); mgit({ "add", "." }); mgit({ "commit", "-qm", "base" })
   set(2, "cache = {}"); set(10, "cache.ttl = 60"); mgit({ "commit", "-qam", "feat: add cache" })
   set(6, "log('hit')"); mgit({ "commit", "-qam", "fix: logging" })
   local tree = mgit({ "rev-parse", "HEAD^{tree}" })
