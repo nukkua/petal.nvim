@@ -6,7 +6,6 @@
 
 local M = {}
 
--- user options, see README / M.setup
 local C = {
   reviewers = {},                                      -- offered by PR create (gh); empty = never asks
   base_branches = { "origin/develop", "origin/main" }, -- tried in order for "merged into", then origin/HEAD
@@ -233,7 +232,6 @@ local function fetch_bg(cb)
   end)
 end
 
--- local + remote branch names, most recently committed first
 local function refs(paths, cb)
   git(cat({ "for-each-ref", "--sort=-committerdate", "--format=%(refname:short)" }, paths), nil, function(r)
     local set, out = S.data and S.data.remoteset or {}, {}
@@ -1626,7 +1624,7 @@ function P.branch()
           end)
         end)
       end },
-      { "r", "Recent (previous branch)", function() act({ "switch", "-" }) end }, -- toggles between the last two
+      { "r", "Recent (previous branch)", function() act({ "switch", "-" }) end },
       { "l", "Local branch", function() refs({ "refs/heads" }, function(l) pick("Checkout", l, function(b) act({ "switch", b }) end) end) end },
       { "c", "New branch", function(_, ctx) input("New branch: ", nil, function(n) act(cat({ "switch", "-c", n }, at(ctx))) end) end },
     } },
