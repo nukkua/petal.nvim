@@ -31,6 +31,7 @@ require("petal").setup({
   recent = 10,                                         -- commits in the Recent section
   height = 12,                                         -- height of the bottom pickers/popups
   commit_suggest = nil,                                -- agent that suggests commit messages, see below
+  mappings = {},                                       -- status keys, see below
 })
 
 vim.keymap.set("n", "<leader>gg", "<cmd>Petal<cr>", { desc = "Git status" })
@@ -38,12 +39,31 @@ vim.keymap.set("n", "<leader>gg", "<cmd>Petal<cr>", { desc = "Git status" })
 
 ## Usage
 
-- `:Petal` opens the status buffer. Press `?` inside it to list every key.
+- `:Petal` opens the status buffer. Press `?` inside it to list every key. Full docs: `:h petal`.
 - `:Petal <args>` runs a single git command, e.g. `:Petal log -5`.
-- `O` opens the PR popup: list (`<CR>` copies the PR URL), create, open, close.
+- `D` opens the diff popup: what your branch adds vs its base (`base...HEAD`), vs any ref, or any range.
+- `O` opens the PR popup: list (`<CR>` copies the PR URL), checkout, diff, checks (`<CR>` on a failed
+  GitHub Actions job shows its failed-step log), create, open, close.
 - Creating a PR with `reviewers` set opens a quickfix picker. `<Tab>` marks one or more reviewers
   and `<CR>` confirms. `<CR>` with nothing marked takes the row under the cursor, and the
   `(no reviewer)` row creates the PR without one.
+
+## Mappings
+
+`mappings` maps a key to an action name (listed in `:h petal-actions`) or to `false` to remove it.
+A key you set replaces its default; the rest stay.
+
+```lua
+require("petal").setup({
+  mappings = {
+    x = false,                 -- no discard on x
+    ["<leader>x"] = "discard", -- discard moves here
+    ["<Tab>"] = "toggle_fold",
+  },
+})
+```
+
+`:checkhealth petal` checks git, gh and its login, fidget, `commit_suggest` and `mappings`.
 
 ## Commit message suggestions
 
@@ -65,6 +85,12 @@ require("petal").setup({
 ```
 
 Any CLI that works this way can be used, e.g. `llm` or `ollama run`.
+
+## Tests
+
+```sh
+nvim -l tests/run.lua
+```
 
 ## Highlights
 
