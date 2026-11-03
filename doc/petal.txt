@@ -136,6 +136,7 @@ In the commit message buffer:
 <C-c><C-c>              Save and commit
 <C-c><C-k>              Abort
 <C-c><C-s>              Accept the suggested message |petal-commit-suggest|
+<C-c><C-y>              Accept the suggested message and commit
 
 ==============================================================================
 5. MAPPINGS                                                   *petal-mappings*
@@ -192,9 +193,10 @@ branch under "Push" (state, mergeable, review, CI). `O` opens the PR popup:
 
 Set `commit_suggest` to a command that reads the staged diff on stdin and
 prints a commit message. It starts when the commit buffer opens; the
-suggestion shows as ghost text while the message is empty and <C-c><C-s>
-accepts it (pressed early, it goes in when it arrives). Closing the buffer
-stops the command.
+suggestion shows as ghost text while the message is empty. <C-c><C-s>
+accepts it, <C-c><C-y> accepts it and commits at once; pressed early, either
+one happens when the message arrives. <C-c><C-y> never overwrites a message
+you typed. Closing the buffer stops the command.
 >lua
   require("petal").setup({
     commit_suggest = { "claude", "-p", "--model", "haiku",

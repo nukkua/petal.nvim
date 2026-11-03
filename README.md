@@ -69,8 +69,9 @@ require("petal").setup({
 
 Set `commit_suggest` to a command that reads the staged diff on stdin and prints a commit
 message. It starts as soon as the commit buffer opens. While the message is empty, the
-suggestion shows as ghost text; press `<c-c><c-s>` to accept it. If you press it before the
-agent answers, the message goes in when it arrives. Typing your own message hides the ghost,
+suggestion shows as ghost text; press `<c-c><c-s>` to accept it, or `<c-c><c-y>` to accept it
+and commit right away. If you press either before the agent answers, it happens when the message
+arrives. Typing your own message hides the ghost (and `<c-c><c-y>` then refuses to overwrite it),
 and closing the buffer stops the agent. Here it is with [Claude Code](https://claude.com/claude-code):
 
 ```lua

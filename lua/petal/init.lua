@@ -13,7 +13,8 @@ local C = {
   recent = 10,                                         -- commits in the Recent section
   height = 12,                                         -- height of the bottom pickers/popups
   commit_suggest = nil,                                -- argv: staged diff on stdin -> commit message on stdout;
-                                                       -- runs when the commit buffer opens, <c-c><c-s> accepts
+                                                       -- runs when the commit buffer opens, <c-c><c-s> accepts,
+                                                       -- <c-c><c-y> accepts and commits
   mappings = {},                                       -- status keys: { [key] = action name | false }, see :h petal-mappings
 }
 local BIND
@@ -2142,14 +2143,18 @@ local function suggest(buf)
     vim.api.nvim_buf_set_extmark(buf, gns, 0, 0, { virt_text = { { msg[1], "Comment" } }, virt_text_pos = "inline",
       virt_lines = #rest > 0 and rest or nil })
   end
-  local function accept()
+  local function accept(commit)
     if not msg then
-      want = true
+      want = commit and "commit" or true
       return notify(job and "still thinking, it goes in when ready" or "no suggestion")
     end
-    vim.api.nvim_buf_clear_namespace(buf, gns, 0, -1)
     local stop = region()
+    if commit and vim.trim(table.concat(vim.api.nvim_buf_get_lines(buf, 0, stop, false), "")) ~= "" then
+      return notify("message already written: <c-c><c-c> commits it", vim.log.levels.WARN) -- never overwrite typed text
+    end
+    vim.api.nvim_buf_clear_namespace(buf, gns, 0, -1)
     vim.api.nvim_buf_set_lines(buf, 0, stop, false, stop < vim.api.nvim_buf_line_count(buf) and cat(msg, { "" }) or msg)
+    if commit then return vim.cmd("stopinsert | write | bwipeout") end
     vim.api.nvim_win_set_cursor(0, { 1, #msg[1] })
   end
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, { buffer = buf, callback = ghost })
@@ -2164,8 +2169,8 @@ local function suggest(buf)
       if r.code ~= 0 then spin("failed") return notify(vim.trim(r.stderr or ""), vim.log.levels.ERROR) end
       msg = lines(vim.trim((r.stdout or ""):gsub("^%s*```%w*\n", ""):gsub("\n```%s*$", ""))) -- models like fences
       if #msg == 0 then msg = nil return spin("empty suggestion") end
-      spin("ready, <c-c><c-s> to accept")
-      if want and vim.api.nvim_get_current_buf() == buf then accept() else ghost() end
+      spin("ready: <c-c><c-s> accepts, <c-c><c-y> commits")
+      if want and vim.api.nvim_get_current_buf() == buf then accept(want == "commit") else ghost() end
     end))
   end)
   return accept
@@ -2194,7 +2199,9 @@ function M.edit(path)
     vim.keymap.set({ "n", "i" }, "<c-c><c-c>", function() vim.cmd("stopinsert | write | bwipeout") end, o)
     vim.keymap.set({ "n", "i" }, "<c-c><c-k>", function() written = false; vim.cmd("stopinsert | bwipeout!") end, o)
     if C.commit_suggest and path:match("COMMIT_EDITMSG$") then
-      vim.keymap.set({ "n", "i" }, "<c-c><c-s>", suggest(buf), vim.tbl_extend("force", o, { desc = "Accept suggested commit message" }))
+      local accept = suggest(buf)
+      vim.keymap.set({ "n", "i" }, "<c-c><c-s>", function() accept() end, vim.tbl_extend("force", o, { desc = "Accept suggested commit message" }))
+      vim.keymap.set({ "n", "i" }, "<c-c><c-y>", function() accept(true) end, vim.tbl_extend("force", o, { desc = "Commit with the suggested message" }))
     end
     if vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] == "" then vim.cmd.startinsert() end
   end)
