@@ -1702,7 +1702,7 @@ end
 ---------------------------------------------------------------- merge mode
 
 -- e on a conflicted file: new tab, ours | theirs on top (diffed), the real file below with its
--- conflict blocks colored. co/ct/cb/c0 keep ours/theirs/both/none, q saves and returns
+-- conflict blocks colored. co/ct/cb/c0 keep ours/theirs/both/none, cO/cT take ours/theirs for every block, q saves and returns
 -- (staging the file when no markers are left). ]c [c jump conflicts here, like changes in the diffed windows
 local mns = vim.api.nvim_create_namespace("petal_merge")
 
@@ -1728,6 +1728,36 @@ local function paint_merge(buf)
   end
 end
 
+-- who ours/theirs really are: in a rebase HEAD is the upstream and theirs is your commit being replayed.
+-- Both git calls run at once and never walk history (for-each-ref --points-at, not name-rev)
+local function merge_sides()
+  local function file(f)
+    local h = io.open(S.gitdir .. "/" .. f)
+    if not h then return nil end
+    local v = vim.trim(h:read("*a"))
+    h:close()
+    return v
+  end
+  local function run(args) return vim.system(vim.list_extend({ "git" }, args), { cwd = S.root, text = true }) end
+  local function out(job) local r = job:wait(); return r.code == 0 and lines(r.stdout) or {} end
+  local st, op, o, t, rev, named = state(), nil, nil, "incoming", nil, nil
+  if st.rebase then op, t, rev, named = "rebase", "your commit", "REBASE_HEAD", file("rebase-merge/onto") or file("rebase-apply/onto")
+  elseif st.merge then op, rev, named = "merge", "MERGE_HEAD", "MERGE_HEAD"
+  elseif st.pick then op, t, rev = "pick", "picked commit", "CHERRY_PICK_HEAD"
+  elseif st.revert then op, t, rev = "revert", "reverted commit", "REVERT_HEAD" end
+  local refs = named and run({ "for-each-ref", "--points-at=" .. named, "--format=%(if)%(symref)%(then)%(else)%(refname:short)%(end)", "refs/heads", "refs/remotes" })
+  local info = out(run({ "show", "-s", "--format=%h %ar", "HEAD", rev }))
+  -- "abc1234 3 days ago" -> "3d", "2 months ago" -> "2mo"
+  local function age(i) return info[i] and (info[i]:gsub("^%S+ (%d+) (%a+).*", function(n, u) return n .. (u:match("^mo") and "mo" or u:sub(1, 1)) end)) end
+  if named then
+    local ref = vim.tbl_filter(function(l) return l ~= "" end, out(refs))[1] or (st.rebase and named:sub(1, 7) or (info[2] or "?"):match("^%S+"))
+    if st.rebase then o = ref .. " (upstream)" else t = ref end
+  end
+  o = o or (file("HEAD") or ""):match("^ref: refs/heads/(.+)") or "HEAD"
+  local function side(label, who, i) return label .. "  " .. who .. (age(i) and (" · " .. age(i)) or "") end
+  return op, side("ours", o, 1), side("theirs", t, 2)
+end
+
 local function merge_mode()
   local it = (S.rows[S.buf] or {})[vim.fn.line(".")]
   local f = it and it.file
@@ -1737,24 +1767,27 @@ local function merge_mode()
   vim.cmd.tabnew(vim.fn.fnameescape(abs))
   local mwin, mbuf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
   local ft = vim.bo.filetype
+  local function show(stage) return vim.system({ "git", "show", ":" .. stage .. ":" .. rel }, { cwd = S.root, text = true }) end
+  local jobs = { [2] = show(2), [3] = show(3) } -- in flight while merge_sides runs its own
+  local op, olabel, tlabel = merge_sides()
   local function side(stage, label, split)
     vim.cmd(split)
-    local r = vim.system({ "git", "show", ":" .. stage .. ":" .. rel }, { cwd = S.root, text = true }):wait()
+    local r = jobs[stage]:wait()
     local b = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_lines(b, 0, -1, false, lines(r.stdout))
     vim.bo[b].bufhidden, vim.bo[b].modifiable, vim.bo[b].filetype = "wipe", false, ft
     pcall(vim.api.nvim_buf_set_name, b, label .. ":" .. rel)
     vim.api.nvim_win_set_buf(0, b)
     vim.cmd("diffthis")
-    vim.wo.winbar = "%#Comment# " .. label .. " %*"
+    vim.wo.winbar = "%#Comment# " .. label:gsub("%%", "%%%%") .. " %*"
     return b
   end
   vim.api.nvim_set_current_win(mwin)
-  local ours = side(2, "ours (HEAD)", "aboveleft split")
-  local theirs = side(3, "theirs (incoming)", "rightbelow vsplit")
+  local ours = side(2, olabel, "aboveleft split")
+  local theirs = side(3, tlabel, "rightbelow vsplit")
   vim.api.nvim_win_set_height(vim.api.nvim_get_current_win(), math.floor(vim.o.lines / 3))
   vim.api.nvim_set_current_win(mwin)
-  vim.wo[mwin].winbar = "%#Comment# merged · co ours  ct theirs  cb both  c0 none  ]c [c  q done %*"
+  vim.wo[mwin].winbar = "%#Comment# " .. (op and (op .. "  ") or "") .. "co ct cb c0  cO cT  ]c [c  q %*"
 
   local aug = vim.api.nvim_create_augroup("petal_merge", { clear = true })
   paint_merge(mbuf)
@@ -1766,15 +1799,25 @@ local function merge_mode()
       if (dir > 0 and list[i].s > cur) or (dir < 0 and list[i].s < cur) then return vim.api.nvim_win_set_cursor(0, { list[i].s, 0 }) end
     end
   end
+  local function resolve(c, which)
+    local L = vim.api.nvim_buf_get_lines(mbuf, c.s - 1, c.e, false)
+    local function part(a, b) return vim.list_slice(L, a - c.s + 1, b - c.s + 1) end
+    local o, t = part(c.s + 1, (c.b or c.m) - 1), part(c.m + 1, c.e - 1)
+    local keep = which == "o" and o or which == "t" and t or which == "b" and vim.list_extend(o, t) or {}
+    vim.api.nvim_buf_set_lines(mbuf, c.s - 1, c.e, false, keep)
+  end
+  -- every conflict block at once; bottom-up so earlier line numbers stay valid
+  local function take_all(which)
+    local list = blocks(mbuf)
+    if #list == 0 then return notify("merge: no conflicts left", vim.log.levels.WARN) end
+    for i = #list, 1, -1 do resolve(list[i], which) end
+    notify(("merge: %d conflict(s) resolved with %s"):format(#list, which == "o" and "ours" or "theirs"))
+  end
   local function take(which)
     local cur = vim.fn.line(".")
     for _, c in ipairs(blocks(mbuf)) do
       if cur >= c.s and cur <= c.e then
-        local L = vim.api.nvim_buf_get_lines(mbuf, c.s - 1, c.e, false)
-        local function part(a, b) return vim.list_slice(L, a - c.s + 1, b - c.s + 1) end
-        local o, t = part(c.s + 1, (c.b or c.m) - 1), part(c.m + 1, c.e - 1)
-        local keep = which == "o" and o or which == "t" and t or which == "b" and vim.list_extend(o, t) or {}
-        vim.api.nvim_buf_set_lines(mbuf, c.s - 1, c.e, false, keep)
+        resolve(c, which)
         vim.api.nvim_win_set_cursor(0, { math.min(c.s, vim.api.nvim_buf_line_count(mbuf)), 0 })
         return jump(1)
       end
@@ -1786,7 +1829,7 @@ local function merge_mode()
     local left = #blocks(mbuf)
     vim.api.nvim_del_augroup_by_id(aug)
     vim.api.nvim_buf_clear_namespace(mbuf, mns, 0, -1)
-    for _, k in ipairs({ "co", "ct", "cb", "c0", "]c", "[c", "q" }) do pcall(vim.keymap.del, "n", k, { buffer = mbuf }) end
+    for _, k in ipairs({ "co", "ct", "cb", "c0", "cO", "cT", "]c", "[c", "q" }) do pcall(vim.keymap.del, "n", k, { buffer = mbuf }) end
     vim.cmd("diffoff! | tabclose")
     if left == 0 then
       act({ "add", "--", rel }, { after = function() notify("merge: " .. rel .. " resolved and staged") end })
@@ -1800,6 +1843,8 @@ local function merge_mode()
   vim.keymap.set("n", "ct", function() take("t") end, o)
   vim.keymap.set("n", "cb", function() take("b") end, o)
   vim.keymap.set("n", "c0", function() take("0") end, o)
+  vim.keymap.set("n", "cO", function() take_all("o") end, o)
+  vim.keymap.set("n", "cT", function() take_all("t") end, o)
   vim.keymap.set("n", "]c", function() jump(1) end, o)
   vim.keymap.set("n", "[c", function() jump(-1) end, o)
   for _, b in ipairs({ mbuf, ours, theirs }) do vim.keymap.set("n", "q", done, { buffer = b, nowait = true }) end
