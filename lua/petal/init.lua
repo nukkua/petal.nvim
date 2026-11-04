@@ -455,13 +455,19 @@ local function builder()
 end
 
 local function refchunks(refs_, ch, set)
-  for r in vim.gsplit(refs_ or "", ", ", { plain = true }) do
+  local rs, here = vim.split(refs_ or "", ", ", { plain = true }), {}
+  for _, r in ipairs(rs) do here[r:match("^HEAD %-> (.+)$") or r] = true end
+  for _, r in ipairs(rs) do
     local head, tag = r:match("^HEAD %-> (.+)$"), r:match("^tag: (.+)$")
-    if head then ch[#ch + 1] = { head, "GitBranchHead" }
-    elseif tag then ch[#ch + 1] = { tag, "GitTagName" }
-    elseif r ~= "" and r ~= "HEAD" then ch[#ch + 1] = { r, set[r:match("^[^/]+")] and "GitRemote" or "GitBranch" }
-    end
-    if r ~= "" and r ~= "HEAD" then ch[#ch + 1] = { " " } end
+    local rem, rest = r:match("^([^/]+)/(.+)$")
+    local x
+    if head then x = { head, "GitBranchHead" }
+    elseif tag then x = { tag, "GitTagName" }
+    elseif rem and set[rem] then
+      -- origin/HEAD is noise; origin/X on the same commit as X says nothing new
+      if rest ~= "HEAD" and not here[rest] then x = { r, "GitRemote" } end
+    elseif r ~= "" and r ~= "HEAD" then x = { r, "GitBranch" } end
+    if x then ch[#ch + 1], ch[#ch + 2] = x, { " " } end
   end
 end
 
@@ -505,7 +511,12 @@ local function kind_of(subject)
   a = subject:match("^Merge branch '(.-)'$") or subject:match("^Merge remote%-tracking branch '(.-)'")
   if a then return "merge", a end
   local n, from = subject:match("^Merge pull request (#%d+) from (%S+)")
-  if n then return "merge", n .. " " .. from end
+  if n then
+    local owner, branch = from:match("^([^/]+)/(.+)$")
+    -- your own org is noise; a fork's owner says whose it is
+    if owner and ((S.data or {}).owners or {})[owner:lower()] then from = branch end
+    return "merge", n .. " " .. from
+  end
   local t, scope, bang, rest = subject:match("^(%a+)(%b())(!?):%s+(.*)$")
   if not t then t, bang, rest = subject:match("^(%a+)(!?):%s+(.*)$") end
   if t and CONVENTIONAL[t:lower()] then return t:lower() .. bang, (scope and (scope .. " ") or "") .. rest end
@@ -545,6 +556,16 @@ local function add_commits(add, list, set, k, avail)
       refchunks(c.refs, rc, set)
       if #rc > 0 then
         rc[#rc] = nil
+        -- refs get at most a third of the row: long branch names never wrap it
+        local left, kept = math.max(math.floor((avail or vim.o.columns) / 3), 12), {}
+        for _, x in ipairs(rc) do
+          if left <= 0 then break end
+          local t = cut(x[1], left)
+          kept[#kept + 1], left = { t, x[2] }, left - vim.api.nvim_strwidth(t)
+          if t ~= x[1] then break end
+        end
+        if kept[#kept][1] == " " then kept[#kept] = nil end
+        rc = kept
         vim.list_extend(ch, { { "(", "GitSubtleText" } })
         vim.list_extend(ch, rc)
         ch[#ch + 1] = { ") ", "GitSubtleText" }
@@ -1013,9 +1034,14 @@ function M.refresh()
       if ref then d.stashes[#d.stashes + 1] = { ref = ref, subject = subj } end
     end
   end)
-  step({ "remote" }, function(r)
-    d.remotes, d.remoteset = lines(r.stdout), {}
-    for _, x in ipairs(d.remotes) do d.remoteset[x] = true end
+  step({ "remote", "-v" }, function(r)
+    d.remotes, d.remoteset, d.owners = {}, {}, {}
+    for _, l in ipairs(lines(r.stdout)) do
+      local name, url = l:match("^(%S+)%s+(%S+)")
+      if name and not d.remoteset[name] then d.remotes[#d.remotes + 1], d.remoteset[name] = name, true end
+      local owner = url and url:gsub("/+$", ""):match("[:/]([^/:]+)/[^/:]+$")
+      if owner then d.owners[owner:lower()] = true end
+    end
   end)
   -- one diff per section, not one process per open file: zR on 200 files was 200 spawns every refresh
   local batch = { unstaged = {}, staged = {} }
@@ -2690,7 +2716,7 @@ M._t = {
     return t
   end,
   bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, hunk_owner = hunk_owner, parse_conflicts = parse_conflicts,
-  parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary, failure = failure, cut = cut,
+  parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary, failure = failure, cut = cut, refchunks = refchunks, S = S,
 }
 
 return M

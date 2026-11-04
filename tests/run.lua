@@ -235,6 +235,27 @@ end)
 
 ---------------------------------------------------------------- errors
 
+test("refchunks: local+remote twins collapse, remote HEAD hidden", function()
+  local function names(refs)
+    local ch = {}
+    t.refchunks(refs, ch, { origin = true })
+    return vim.tbl_map(function(c) return c[1] end, vim.tbl_filter(function(c) return c[1] ~= " " end, ch))
+  end
+  eq(names("HEAD -> develop, origin/develop, origin/HEAD"), { "develop" })
+  eq(names("origin/feat/x, feat/x"), { "feat/x" })
+  eq(names("origin/feat/x"), { "origin/feat/x" }) -- not pushed/pulled: both matter
+  eq(names("feat/x, tag: v1"), { "feat/x", "v1" })
+end)
+
+test("kind_of: own org dropped from PR merges, forks keep owner", function()
+  local saved = t.S.data
+  t.S.data = { owners = { klubomobi = true } }
+  eq({ t.kind_of("Merge pull request #597 from KLUBOMOBI/payment-method") }, { "merge", "#597 payment-method" })
+  eq({ t.kind_of("Merge pull request #5 from someone/fix/x") }, { "merge", "#5 someone/fix/x" })
+  t.S.data = saved
+  eq({ t.kind_of("Merge pull request #12 from me/x") }, { "merge", "#12 me/x" }) -- no remotes known
+end)
+
 test("cut: fits display width, wide chars included", function()
   eq(t.cut("nukkua", 16), "nukkua")
   eq(t.cut("María Fernanda Gutiérrez", 16), "María Fernanda …")
