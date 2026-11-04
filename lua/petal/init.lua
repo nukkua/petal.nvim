@@ -482,7 +482,11 @@ end
 
 local function cut(str, n)
   if vim.api.nvim_strwidth(str) <= n then return str end
-  return n < 1 and "" or vim.fn.strcharpart(str, 0, n - 1) .. "…"
+  if n < 1 then return "" end
+  local s = vim.fn.strcharpart(str, 0, n - 1)
+  -- by display width, not chars: CJK/emoji take 2 cells
+  while vim.api.nvim_strwidth(s) > n - 1 do s = vim.fn.strcharpart(s, 0, vim.fn.strchars(s) - 1) end
+  return s .. "…"
 end
 
 -- one meaning per color, everywhere: new work green, fix rose, integration teal, branch moves sakura,
@@ -525,6 +529,7 @@ local function add_commits(add, list, set, k, avail)
     kw = math.max(kw, #(c.kind or ""))
     aw = math.max(aw, vim.api.nvim_strwidth(c.author or ""))
   end
+  aw = math.min(aw, 16) -- one long name must not widen every row and squeeze the subjects
   for i, c in ipairs(list) do
     local ch, g = {}, c.graph or ""
     for j = 1, #g do
@@ -558,7 +563,8 @@ local function add_commits(add, list, set, k, avail)
     if c.hash then
       local subj = cut(c.detail, w - pw)
       vim.list_extend(ch, { { subj }, { (" "):rep(math.max(w - pw - vim.api.nvim_strwidth(subj), 0) + 2) } })
-      if aw > 0 then vim.list_extend(ch, { { c.author, "GitGraphAuthor" }, { (" "):rep(aw - vim.api.nvim_strwidth(c.author) + 1) } }) end
+      local a = cut(c.author or "", aw)
+      if aw > 0 then vim.list_extend(ch, { { a, "GitGraphAuthor" }, { (" "):rep(aw - vim.api.nvim_strwidth(a) + 1) } }) end
       ch[#ch + 1] = { ("%3s"):format(age(c.date)), "GitSubtleText" }
     end
     add(ch, c.hash and { section = k, commit = c.hash } or nil)
@@ -2684,7 +2690,7 @@ M._t = {
     return t
   end,
   bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, hunk_owner = hunk_owner, parse_conflicts = parse_conflicts,
-  parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary, failure = failure,
+  parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary, failure = failure, cut = cut,
 }
 
 return M

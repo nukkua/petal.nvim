@@ -235,6 +235,14 @@ end)
 
 ---------------------------------------------------------------- errors
 
+test("cut: fits display width, wide chars included", function()
+  eq(t.cut("nukkua", 16), "nukkua")
+  eq(t.cut("María Fernanda Gutiérrez", 16), "María Fernanda …")
+  eq(t.cut("日本語の名前", 6), "日本…") -- 2-cell chars: 4 cells + …
+  eq(vim.api.nvim_strwidth(t.cut("日本語の名前", 7)) <= 7, true) -- odd width: never overflows
+  eq(t.cut("abc", 0), "")
+end)
+
 test("failure: real git output -> short message + level", function()
   local W, E = vim.log.levels.WARN, vim.log.levels.ERROR
   local function f(cmd)
