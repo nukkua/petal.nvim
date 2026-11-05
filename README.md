@@ -111,6 +111,8 @@ Git groups are named `Git*` (e.g. `GitSectionHeader`, `GitDiffAdd`) and PR group
 - [vim-fugitive](https://github.com/tpope/vim-fugitive) showed that Neovim can wrap the git CLI
   directly.
 
+Designed and developed with AI-assisted implementation. I defined the requirements, workflows, and desired behavior.
+
 ## License
 
 [MIT](LICENSE)
