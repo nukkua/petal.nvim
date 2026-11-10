@@ -360,9 +360,10 @@ local function commit_count(list)
   return n
 end
 
+-- out: git's output, or its lines already split (and trimmed, as lines() does)
 local function parse_diff(out)
   local d, h = { header = {}, hunks = {} }, nil
-  for _, l in ipairs(lines(out)) do
+  for _, l in ipairs(type(out) == "table" and out or lines(out)) do
     if l:sub(1, 2) == "@@" then
       h = { header = l, lines = {}, new = tonumber(l:match("%+(%d+)")) or 1 }
       table.insert(d.hunks, h)
@@ -396,6 +397,7 @@ local function diff_args(f)
   return cat({ "diff" }, f.section == "staged" and { "--cached" } or {}, { "--", f.path, f.orig })
 end
 
+
 -- one batched `git diff` per section, split back per file by its `diff --git` header (a typechange
 -- emits two sections with the same header; they concatenate, as a per-file diff would)
 local function split_diff(out)
@@ -409,6 +411,65 @@ end
 -- ponytail: paths git would quote ("\ or control chars) can't be matched by header; they get their own diff
 local function batchable(f) return not (f.path .. (f.orig or "")):find('[%c"\\]') end
 local function diff_header(f) return "diff --git a/" .. (f.orig or f.path) .. " b/" .. f.path end
+
+-- could a .gitattributes (binary, textconv, diff driver) change git's diff of this path?
+-- S.attrs: info/attributes or the global attributes file exists (checked on open)
+-- cache: dir -> has a .gitattributes, one table per refresh (500 files share a few dirs)
+local function attrs_may_apply(path, cache)
+  cache = cache or {}
+  if S.attrs then return true end
+  local dir = path:match("^(.*)/[^/]*$")
+  while true do
+    local k = dir or ""
+    local has = cache[k]
+    if has == nil then
+      has = vim.uv.fs_stat(S.root .. "/" .. (dir and (dir .. "/") or "") .. ".gitattributes") ~= nil
+      cache[k] = has
+    end
+    if has then return true end
+    if not dir then return false end
+    dir = dir:match("^(.*)/[^/]*$")
+  end
+end
+
+-- `git diff --no-index /dev/null <untracked>` built in Lua: an untracked diff is the whole file as +
+-- lines, and git can't batch --no-index, so zR over 500 untracked files was 500 spawns per refresh.
+-- Same parsed result as git's (binary = a NUL in the first 8000 bytes, as git checks), minus the
+-- index line (blob hashes; git apply doesn't need it). nil = let git do it: attributes in play,
+-- a path git would quote, or not a regular file/symlink
+local function untracked_diff(f, cache)
+  local empty = { header = {}, hunks = {} }
+  if f.path:sub(-1) == "/" then return empty end -- git errors on a directory: nothing to show either way
+  if not batchable(f) or attrs_may_apply(f.path, cache) then return nil end
+  local full = S.root .. "/" .. f.path
+  local st = vim.uv.fs_lstat(full)
+  if not st then return empty end -- gone since status ran
+  local data, mode
+  if st.type == "link" then
+    data, mode = vim.uv.fs_readlink(full), "120000"
+  elseif st.type == "file" then
+    local h = io.open(full, "rb")
+    if not h then return empty end
+    data, mode = h:read("*a"), bit.band(st.mode, 64) ~= 0 and "100755" or "100644"
+    h:close()
+  end
+  if not data then return nil end
+  local header = { "diff --git a/" .. f.path .. " b/" .. f.path, "new file mode " .. mode }
+  if data == "" then return { header = header, hunks = {} } end
+  if data:sub(1, 8000):find("\0", 1, true) then
+    header[#header + 1] = "Binary files /dev/null and b/" .. f.path .. " differ"
+    return { header = header, hunks = {} }
+  end
+  -- git ends a name with a space in a tab, so patch tools know where it stops
+  vim.list_extend(header, { "--- /dev/null", "+++ b/" .. f.path .. (f.path:find(" ", 1, true) and "\t" or "") })
+  data = data:gsub("\r\n", "\n") -- as vim.system's text mode does to git's output
+  local nl = data:sub(-1) == "\n"
+  local ls = vim.split(nl and data:sub(1, -2) or data, "\n", { plain = true })
+  for i, l in ipairs(ls) do ls[i] = "+" .. l end
+  if not nl then ls[#ls + 1] = "\\ No newline at end of file" end
+  local n = #ls - (nl and 0 or 1)
+  return { header = header, hunks = { { header = n == 1 and "@@ -0,0 +1 @@" or ("@@ -0,0 +1," .. n .. " @@"), lines = ls, new = 1 } } }
+end
 
 local function fkey(f) return f.section .. ":" .. f.path end
 
@@ -1055,10 +1116,13 @@ function M.refresh()
     end
   end)
   -- one diff per section, not one process per open file: zR on 200 files was 200 spawns every refresh
-  local batch = { unstaged = {}, staged = {} }
+  local batch, attr_cache = { unstaged = {}, staged = {} }, {}
   for k, f in pairs(S.open) do
+    local native = f.section == "untracked" and untracked_diff(f, attr_cache)
     if f.mode == "U" then
       diffs[k] = { conflicts = parse_conflicts(S.root .. "/" .. f.path) }
+    elseif native then
+      diffs[k] = native
     elseif batch[f.section] and batchable(f) then
       table.insert(batch[f.section], { k, f })
     else
@@ -1072,7 +1136,11 @@ function M.refresh()
       for _, e in ipairs(fs) do vim.list_extend(args, { e[2].path, e[2].orig }) end
       step(args, function(r)
         local by = split_diff(r.stdout)
-        for _, e in ipairs(fs) do diffs[e[1]] = parse_diff(table.concat(by[diff_header(e[2])] or {}, "\n")) end
+        for _, e in ipairs(fs) do
+          local ls = by[diff_header(e[2])] or {}
+          while ls[#ls] == "" do ls[#ls] = nil end -- what lines() trimmed when this was re-joined and split
+          diffs[e[1]] = parse_diff(ls)
+        end
       end)
     end
   end
@@ -1694,6 +1762,11 @@ end
 local function load(f, k)
   if f.mode == "U" then
     S.diffs[k] = { conflicts = parse_conflicts(S.root .. "/" .. f.path) }
+    return render()
+  end
+  local native = f.section == "untracked" and untracked_diff(f)
+  if native then
+    S.diffs[k] = native
     return render()
   end
   git(diff_args(f), nil, function(r)
@@ -2645,6 +2718,10 @@ function M.open()
     unwatch_all()
   end
   S.root, S.gitdir = root, gitdir
+  -- repo-wide attribute files: when one exists, untracked diffs go through git (attrs_may_apply)
+  local af = vim.trim(vim.system({ "git", "config", "--path", "--get", "core.attributesFile" }, { cwd = root, text = true }):wait().stdout or "")
+  if af == "" then af = (vim.env.XDG_CONFIG_HOME or (vim.uv.os_homedir() .. "/.config")) .. "/git/attributes" end
+  S.attrs = vim.uv.fs_stat(gitdir .. "/info/attributes") ~= nil or vim.uv.fs_stat(af) ~= nil
   S.pr_at = {} -- opening always rechecks the PR
 
   if not (S.buf and vim.api.nvim_buf_is_valid(S.buf)) then
@@ -2794,7 +2871,7 @@ M._t = {
     for _, g in ipairs(KEYS) do for _, k in ipairs(g[2]) do t[k[2]] = true end end
     return t
   end,
-  bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, hunk_owner = hunk_owner, parse_conflicts = parse_conflicts,
+  bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, lines = lines, untracked_diff = untracked_diff, hunk_owner = hunk_owner, parse_conflicts = parse_conflicts,
   parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary, failure = failure, cut = cut, refchunks = refchunks, S = S,
 }
 

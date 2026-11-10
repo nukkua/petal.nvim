@@ -282,6 +282,68 @@ test("failure: real git output -> short message + level", function()
   eq(t.failure({ code = 3, stderr = "", stdout = "" }), "exited 3")
 end)
 
+test("parse_diff: split lines give the same result as the joined text", function()
+  local bdir = vim.fn.tempname()
+  vim.fn.mkdir(bdir, "p")
+  local function bgit(args) return vim.system(vim.list_extend({ "git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false" }, args), { cwd = bdir, text = true }):wait().stdout end
+  local function put(name, data) local h = assert(io.open(bdir .. "/" .. name, "wb")); h:write(data); h:close() end
+  bgit({ "init", "-q" })
+  put("a", "1\n\n2\n\n"); put("b", "x\r\ny\r\n"); put("c", "p\nq")
+  bgit({ "add", "." }); bgit({ "commit", "-qm", "i" })
+  put("a", "1\n\n3\n\n\n"); put("b", "x\r\nz\r\n"); put("c", "p\nr")
+  for _, extra in ipairs({ {}, { "-c", "diff.suppressBlankEmpty=true" } }) do
+    local out = bgit(vim.list_extend(vim.list_extend({}, extra), { "diff", "--src-prefix=a/", "--dst-prefix=b/" }))
+    local by = t.split_diff(out)
+    for _, p in ipairs({ "a", "b", "c" }) do
+      local ls = by["diff --git a/" .. p .. " b/" .. p]
+      local old = t.parse_diff(table.concat(ls, "\n"))
+      local copy = vim.list_extend({}, ls)
+      while copy[#copy] == "" do copy[#copy] = nil end
+      eq(t.parse_diff(copy), old, p .. " " .. table.concat(extra, " "))
+    end
+  end
+  vim.fn.delete(bdir, "rf")
+end)
+
+test("untracked_diff: same result as git diff --no-index", function()
+  local udir = vim.fn.tempname()
+  vim.fn.mkdir(udir .. "/d", "p")
+  local function put(name, data) local h = assert(io.open(udir .. "/" .. name, "wb")); h:write(data); h:close() end
+  put("text", "a\nb\n"); put("nonl", "a\nb"); put("one", "x\n"); put("bin", "x\0y"); put("empty", "")
+  put("crlf", "a\r\nb\r\n"); put("blank", "\n\n"); put("a b", "sp\n"); put("é", "u\n"); put("d/q", "q\n")
+  put("exe", "run\n"); vim.uv.fs_chmod(udir .. "/exe", tonumber("755", 8))
+  vim.uv.fs_symlink("text", udir .. "/link")
+  local root, attrs = t.S.root, t.S.attrs
+  t.S.root, t.S.attrs = udir, false
+  local function via_git(path)
+    local r = vim.system({ "git", "-c", "core.quotePath=false", "diff", "--no-index", "--", "/dev/null", path }, { cwd = udir, text = true }):wait()
+    local d = t.parse_diff(r.stdout)
+    d.header = vim.tbl_filter(function(l) return not l:match("^index ") end, d.header)
+    return d
+  end
+  for _, p in ipairs({ "text", "nonl", "one", "bin", "empty", "crlf", "blank", "a b", "é", "d/q", "exe", "link" }) do
+    eq(t.untracked_diff({ section = "untracked", path = p }), via_git(p), p)
+  end
+  eq(t.untracked_diff({ section = "untracked", path = "d/" }), { header = {}, hunks = {} }, "dir")
+  eq(t.untracked_diff({ section = "untracked", path = 'q"uote' }), nil, "path git would quote -> git")
+  put(".gitattributes", "*.txt diff=x\n")
+  eq(t.untracked_diff({ section = "untracked", path = "d/q" }), nil, "attributes in play -> git")
+  vim.fn.delete(udir .. "/.gitattributes")
+  t.S.attrs = true
+  eq(t.untracked_diff({ section = "untracked", path = "text" }), nil, "global attributes -> git")
+  -- the header without its index line still stages: first line only, through patch() like s does
+  t.S.attrs = false
+  vim.system({ "git", "init", "-q" }, { cwd = udir }):wait()
+  local d = t.untracked_diff({ section = "untracked", path = "text" })
+  local items = { { hunk = d.hunks[1], idx = 1 } }
+  local p = t.patch({ item = { diff = d, hunk = d.hunks[1] }, visual = true, items = items }, false)
+  local r = vim.system({ "git", "apply", "--recount", "--cached", "-" }, { cwd = udir, stdin = p, text = true }):wait()
+  eq(r.code, 0, r.stderr)
+  eq(vim.system({ "git", "show", ":text" }, { cwd = udir, text = true }):wait().stdout, "a\n")
+  t.S.root, t.S.attrs = root, attrs
+  vim.fn.delete(udir, "rf")
+end)
+
 -- end to end through the UI (last: it opens the status in its own repo)
 test("move_hunk: hunk moves to a later commit, end result unchanged", function()
   local mdir = vim.fn.tempname()
