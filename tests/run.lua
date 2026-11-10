@@ -282,6 +282,23 @@ test("failure: real git output -> short message + level", function()
   eq(t.failure({ code = 3, stderr = "", stdout = "" }), "exited 3")
 end)
 
+test("failure: login errors -> cause and fix, git's line as detail", function()
+  local function hint(stderr)
+    local msg, lvl = t.failure({ code = 128, stderr = stderr })
+    eq(lvl, vim.log.levels.ERROR)
+    return msg
+  end
+  local m = hint("fatal: could not read Username for 'https://github.com': terminal prompts disabled\n")
+  eq(m:match("^remote needs a login") ~= nil, true, m)
+  eq(m:match("\ncould not read Username for 'https://github.com': terminal prompts disabled$") ~= nil, true, m)
+  eq(hint("git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.\n")
+    :match("^SSH key rejected") ~= nil, true)
+  eq(hint("Host key verification failed.\nfatal: Could not read from remote repository.\n")
+    :match("^remote's SSH host key") ~= nil, true)
+  eq(hint("remote: Invalid username or token.\nfatal: Authentication failed for 'https://github.com/a/b.git/'\n")
+    :match("^saved credentials were rejected") ~= nil, true)
+end)
+
 test("paint: incremental repaints end with the same lines and highlights as a fresh paint", function()
   math.randomseed(7)
   local function marks(b)

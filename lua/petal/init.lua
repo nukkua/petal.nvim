@@ -112,6 +112,15 @@ local QUIET = {
   { "No stash entries found", "no stash entries" },
   { "^nothing to commit" }, { "^nothing added to commit" }, { "^no changes added to commit" },
 }
+-- login failures: git runs with no tty (see git()), so it can't ask for a username, password or
+-- passphrase and prints its internals instead. Say what's wrong and how to fix it; git's line stays as detail
+local AUTH = {
+  { "terminal prompts disabled",
+    "remote needs a login and petal can't prompt for one: switch to an SSH remote (git remote set-url origin git@host:owner/repo.git) or run gh auth setup-git" },
+  { "Permission denied %(publickey", "SSH key rejected: load it with ssh-add, or add it to your account on the remote" },
+  { "Host key verification failed", "remote's SSH host key isn't trusted yet: run ssh -T git@<host> once in a terminal to accept it" },
+  { "Authentication failed for", "saved credentials were rejected (expired token?): run gh auth login, then gh auth setup-git" },
+}
 -- failed git/gh result -> message, level: hints and (use …) advice dropped, fatal:/error: stripped,
 -- at most 6 lines (the rest is in history, $). A failure only on stdout ends in its verdict line
 local function failure(r)
@@ -124,6 +133,9 @@ local function failure(r)
     end
   end
   if not stderr then out = { out[#out] } end
+  for _, a in ipairs(AUTH) do
+    for _, l in ipairs(out) do if l:match(a[1]) then return a[2] .. "\n" .. l, vim.log.levels.ERROR end end
+  end
   for _, q in ipairs(QUIET) do
     for _, l in ipairs(out) do if l:match(q[1]) then return q[2] or l, vim.log.levels.WARN end end
   end
