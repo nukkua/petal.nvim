@@ -32,6 +32,7 @@ require("petal").setup({
   height = 12,                                         -- height of the bottom pickers/popups
   commit_suggest = nil,                                -- agent that suggests commit messages, see below
   mappings = {},                                       -- status keys, see below
+  watch = true,                                        -- refresh when the repo changes outside nvim
 })
 
 vim.keymap.set("n", "<leader>gg", "<cmd>Petal<cr>", { desc = "Git status" })

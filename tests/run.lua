@@ -316,6 +316,31 @@ test("move_hunk: hunk moves to a later commit, end result unchanged", function()
   vim.fn.delete(mdir, "rf")
 end)
 
+test("watch: changes made outside nvim refresh the open status", function()
+  local wdir = vim.fn.tempname()
+  vim.fn.mkdir(wdir .. "/sub", "p")
+  local function wgit(args) local r = vim.system(vim.list_extend({ "git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false" }, args), { cwd = wdir, text = true }):wait(); assert(r.code == 0, r.stderr); return r.stdout end
+  wgit({ "init", "-q", "-b", "main" })
+  vim.fn.writefile({ "a" }, wdir .. "/sub/a.txt")
+  wgit({ "add", "." }); wgit({ "commit", "-qm", "base" })
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(wdir)
+  petal.open()
+  local function shows(pat) return vim.wait(3000, function() return vim.fn.search(pat, "nw") > 0 end, 20) end
+  assert(shows("Recent"), "status never rendered")
+  vim.wait(500, function() return vim.tbl_count(t.S.watch) >= 4 end, 10) -- gitdir, refs, refs/heads, root, sub
+  -- writefile is no BufWritePost and there's no FocusGained: only the watcher can notice these
+  vim.fn.writefile({ "b" }, wdir .. "/sub/a.txt")
+  assert(shows("sub/a.txt"), "edit in a subdirectory not picked up")
+  vim.fn.mkdir(wdir .. "/new", "p")
+  vim.fn.writefile({ "x" }, wdir .. "/new/x.txt")
+  assert(shows("new/"), "new untracked directory not picked up")
+  wgit({ "commit", "-qam", "outside commit" })
+  assert(shows("outside commit"), "commit from another terminal not picked up")
+  vim.cmd.cd(cwd)
+  vim.fn.delete(wdir, "rf")
+end)
+
 vim.fn.delete(dir, "rf")
 print(("%d/%d passed"):format(n - fails, n))
 os.exit(fails > 0 and 1 or 0)

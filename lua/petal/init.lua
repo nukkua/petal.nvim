@@ -15,6 +15,7 @@ local C = {
                                                        -- runs when the commit buffer opens, <c-c><c-s> accepts,
                                                        -- <c-c><c-y> accepts and commits
   mappings = {},                                       -- status keys: { [key] = action name | false }, see :h petal-mappings
+  watch = true,                                        -- refresh the open status when the repo changes on disk
 }
 local BIND
 function M.setup(opts) -- shallow: list options replace, not merge
@@ -33,6 +34,8 @@ local S = {
   base = nil,                        -- integration branch the conflict radar checks (find_base, cached per repo)
   queue = {},                        -- serialized index/worktree commands, head is running
   seq = 0,                           -- refresh generation: stale async results are dropped
+  refreshed = 0,                     -- hrtime() of the last refresh: a watch event older than it is already shown
+  watch = {},                        -- dir -> uv fs_event handle while the status is open
 }
 local ns = vim.api.nvim_create_namespace("petal")
 local FETCH_TTL = 30000 -- ms: a fetch this fresh is reused instead of hitting the network again
@@ -1009,7 +1012,7 @@ end
 function M.refresh()
   local buf = S.buf
   if not (S.root and buf and vim.api.nvim_buf_is_valid(buf)) then return end
-  S.seq = S.seq + 1
+  S.seq, S.refreshed = S.seq + 1, vim.uv.hrtime()
   local seq, d, diffs, pending = S.seq, {}, {}, 0
   local function step(args, fn)
     pending = pending + 1
@@ -2560,6 +2563,71 @@ function M.maps(buf, log, over)
   end
 end
 
+---------------------------------------------------------------- watch
+
+-- refresh on changes made outside nvim (another terminal, an agent, a git GUI). libuv fs_event is not
+-- recursive on Linux, so every directory holding a tracked or untracked file gets its own watch, plus
+-- the git dir (index, HEAD) and refs. Status runs with --no-optional-locks, so a refresh doesn't
+-- rewrite the index and trigger itself
+local WATCH_MAX = 1000 -- dirs; past this (huge monorepo) only the git dir is watched
+local WATCH_DELAY = 300 -- ms: a burst of writes (checkout, :wa, a build) becomes one refresh
+local watch_sync
+local watch_timer, watch_at = nil, 0
+
+local function unwatch(dir)
+  local h = S.watch[dir]
+  if h and not h:is_closing() then h:stop() h:close() end
+  S.watch[dir] = nil
+end
+local function unwatch_all() for dir in pairs(S.watch) do unwatch(dir) end end
+
+local function on_change(dir, name)
+  if not S.watch[dir] then return end -- queued before an unwatch (repo switched, dir gone)
+  if name and name:match("%.lock$") then return end -- git's lock dance: the rename to the real name follows
+  -- the latest event, not the first: a refresh that started mid-burst may predate the later writes.
+  -- hrtime, not uv.now(): that is the loop's cached time, a refresh started earlier can share it
+  watch_at = vim.uv.hrtime()
+  if watch_timer then return end
+  watch_timer = vim.defer_fn(function()
+    watch_timer = nil
+    local at = watch_at
+    if not (S.buf and vim.api.nvim_buf_is_valid(S.buf)) then return unwatch_all() end
+    if vim.fn.bufwinid(S.buf) == -1 then return end -- hidden: BufWinEnter refreshes on the way back
+    watch_sync() -- new directories, deleted ones
+    if S.refreshed < at then M.refresh() end -- our own action (or :w) already refreshed after it
+  end, WATCH_DELAY)
+end
+
+local function watch(dir)
+  if S.watch[dir] then return end
+  local h = vim.uv.new_fs_event()
+  if not h then return end
+  local ok = h:start(dir, {}, function(err, name)
+    if not err then vim.schedule(function() on_change(dir, name) end) end
+  end)
+  if ok then S.watch[dir] = h else h:close() end -- ENOSPC (inotify limit) or a dir gone already
+end
+
+function watch_sync()
+  if not C.watch or not S.root then return unwatch_all() end
+  local root, gitdir = S.root, S.gitdir
+  git({ "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--directory" }, nil, function(r)
+    if root ~= S.root or r.code ~= 0 then return end
+    local want = { [gitdir] = true, [gitdir .. "/refs"] = true, [gitdir .. "/refs/heads"] = true, [root] = true }
+    local n = 0
+    for _, p in ipairs(vim.split(r.stdout, "\0", { plain = true, trimempty = true })) do
+      local dir = p:match("^(.*)/$") or p:match("^(.*)/[^/]*$") -- "dir/" is an untracked dir: watch it
+      while dir and not want[root .. "/" .. dir] and n < WATCH_MAX do
+        want[root .. "/" .. dir], n = true, n + 1
+        dir = dir:match("^(.*)/[^/]*$")
+      end
+    end
+    if n >= WATCH_MAX then want = { [gitdir] = true, [gitdir .. "/refs"] = true, [gitdir .. "/refs/heads"] = true } end
+    for dir in pairs(S.watch) do if not want[dir] then unwatch(dir) end end
+    for dir in pairs(want) do watch(dir) end
+  end)
+end
+
 ---------------------------------------------------------------- open / editor
 
 -- ~ is a dotfiles repo: a non-repo subdir must not fall back to it, offer git init instead
@@ -2574,6 +2642,7 @@ function M.open()
   end
   if root ~= S.root then
     S.open, S.diffs, S.data, S.fetch.at, S.base = {}, {}, nil, -math.huge, nil
+    unwatch_all()
   end
   S.root, S.gitdir = root, gitdir
   S.pr_at = {} -- opening always rechecks the PR
@@ -2586,6 +2655,7 @@ function M.open()
     M.maps(S.buf)
     -- BufWinEnter, not BufEnter: coming back from a popup/picker window is not a reason to refresh
     vim.api.nvim_create_autocmd("BufWinEnter", { buffer = S.buf, callback = function() M.refresh() end })
+    vim.api.nvim_create_autocmd("BufWipeout", { buffer = S.buf, callback = unwatch_all })
     -- group cleared: a wiped and recreated status buffer must not stack another set of global handlers
     local aug, queued = vim.api.nvim_create_augroup("petal_status", { clear = true }), false
     local function visible() return S.buf and vim.fn.bufwinid(S.buf) ~= -1 end
@@ -2606,6 +2676,7 @@ function M.open()
   else
     M.refresh()
   end
+  watch_sync()
   fetch_bg()
 end
 

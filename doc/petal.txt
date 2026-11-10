@@ -39,6 +39,7 @@ are moved to `.git/petal-trash/` instead of being deleted.
     height = 12,
     commit_suggest = nil,
     mappings = {},
+    watch = true,
   })
 <
 Options are merged one level deep: a list or table you pass replaces the
@@ -69,6 +70,13 @@ commit_suggest                                    *petal-opt-commit_suggest*
 
 mappings                                                *petal-opt-mappings*
   Key overrides for the status buffer, see |petal-mappings|.
+
+watch                                                      *petal-opt-watch*
+  Refresh the visible status when the repo changes on disk outside Neovim:
+  edits from another terminal or tool, commits, checkouts. Every directory
+  with a tracked or untracked file is watched (up to 1000; past that only
+  the git dir, so commits and staging still show). `false`: refresh only on
+  open, |BufWritePost|, |FocusGained| and `<C-r>`.
 
 ==============================================================================
 3. USAGE                                                         *petal-usage*
