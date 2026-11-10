@@ -161,15 +161,22 @@ local function git(args, opts, cb)
     NVIM_BIN = vim.v.progpath, GIT_TERMINAL_PROMPT = "0" }
   for k, v in pairs(opts.env or {}) do env[k] = v end
   local t0 = vim.uv.hrtime()
-  vim.system(cmd, { cwd = S.root, text = true, env = env, stdin = opts.stdin, detach = true },
-    vim.schedule_wrap(function(r)
+  local on_exit = vim.schedule_wrap(function(r)
       if opts.log then
         table.insert(S.history, 1, { cmd = table.concat(cmd, " "), code = r.code,
           ms = math.floor((vim.uv.hrtime() - t0) / 1e6), out = vim.trim((r.stdout or "") .. (r.stderr or "")) })
         S.history[HISTORY_MAX + 1] = nil
       end
       if cb then cb(r) end
-    end))
+    end)
+  -- a missing executable (no gh installed) throws ENOENT here: report it as a normal failed result
+  local ok, err = pcall(vim.system, cmd, { cwd = S.root, text = true, env = env, stdin = opts.stdin, detach = true }, on_exit)
+  if not ok then
+    local missing = vim.fn.executable(cmd[1]) == 0
+    on_exit({ code = 127, signal = 0, stdout = "", stderr = missing
+      and (cmd[1] .. " not found" .. (cmd[1] == "gh" and ": install it from https://cli.github.com" or ""))
+      or tostring(err) })
+  end
 end
 
 -- read-only buffer in this window; q goes back one step (log -> show -> q -> log, cursor kept)
@@ -210,7 +217,7 @@ local function act(args, opts)
     git(args, { log = true, raw = opts.raw, stdin = opts.stdin, env = opts.env }, function(r)
       local out = vim.trim((r.stdout or "") .. "\n" .. (r.stderr or ""))
       if r.code ~= 0 then
-        fail(args and args[1] or (opts.raw[#opts.raw]:match("^git%s+([%w-]+)")) or "git", r, spin)
+        fail(args and args[1] or (opts.raw[1] == "gh" and opts.raw[2]) or (opts.raw[#opts.raw]:match("^git%s+([%w-]+)")) or "git", r, spin)
       elseif spin and opts.show and out ~= "" and #lines(out) <= 8 then
         spin(out) -- short output becomes the spinner's success message
       else
@@ -858,6 +865,7 @@ function PR.status()
   local spin = progress("PR", "gh pr view")
   gh({ "pr", "view", "--json", "number,state,title,isDraft,mergeable,reviewDecision,statusCheckRollup,headRefName" }, {}, function(r)
     local pr = json(r)
+    if r.code == 127 then return fail("pr", r, spin) end
     spin(pr and pr.number and "done" or "no PR for this branch")
     if not (pr and pr.number) then return end
     local s = pr_state(pr)
