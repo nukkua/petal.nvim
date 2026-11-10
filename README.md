@@ -3,6 +3,7 @@
 Magit-style git status for Neovim, built on the git CLI. Every git call is async, and there's
 GitHub PR support through `gh`.
 
+
 ## Requirements
 
 - Neovim 0.12+
