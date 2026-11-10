@@ -282,6 +282,82 @@ test("failure: real git output -> short message + level", function()
   eq(t.failure({ code = 3, stderr = "", stdout = "" }), "exited 3")
 end)
 
+test("paint: incremental repaints end with the same lines and highlights as a fresh paint", function()
+  math.randomseed(7)
+  local function marks(b)
+    return vim.tbl_map(function(m) return { m[2], m[3], m[4].end_col, m[4].hl_group } end,
+      vim.api.nvim_buf_get_extmarks(b, t.ns, 0, -1, { details = true }))
+  end
+  local function frame()
+    local L, H = {}, {}
+    local pool = { "Head: main", "", "Unstaged (2)", "modified a", "+x", "-y", " ctx", "@@ -1 +1 @@", "Recent" }
+    for i = 1, math.random(0, 60) do
+      local l = pool[math.random(#pool)]
+      if math.random() < 0.2 then l = string.rep("+big", 1) .. i end -- some unique rows
+      L[i] = l
+      -- paint's contract: a line's highlight follows from its text (render works that way), so an
+      -- unchanged line keeps its marks. Same text -> same highlight here too
+      local hl = ({ ["+"] = "GitDiffAdd", ["-"] = "GitDiffDelete", U = "Title", m = "GitChangeModified" })[l:sub(1, 1)]
+      if hl then H[#H + 1] = { i - 1, 0, #l, hl } end
+    end
+    return L, H
+  end
+  local buf = vim.api.nvim_create_buf(false, true)
+  for step = 1, 300 do
+    local L, H = frame()
+    if step % 7 == 0 then L, H = {}, {} end -- collapse everything
+    t.paint(buf, L, H)
+    local fresh = vim.api.nvim_create_buf(false, true)
+    t.paint(fresh, L, H)
+    eq(vim.api.nvim_buf_get_lines(buf, 0, -1, false), vim.api.nvim_buf_get_lines(fresh, 0, -1, false), "lines at step " .. step)
+    local want = marks(fresh)
+    eq(marks(buf), want, "marks at step " .. step)
+    vim.api.nvim_buf_delete(fresh, { force = true })
+    if step % 5 == 0 then t.paint(buf, L, H) eq(marks(buf), want, "identical repaint " .. step) end
+  end
+  vim.api.nvim_buf_delete(buf, { force = true })
+end)
+
+test("git_batch: one process, same results as one spawn per command", function()
+  local gdir = vim.fn.tempname()
+  vim.fn.mkdir(gdir, "p")
+  local function g(args, o) return vim.system(vim.list_extend({ "git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false" }, args), vim.tbl_extend("force", { cwd = gdir, text = true }, o or {})):wait() end
+  g({ "init", "-q" })
+  local h = assert(io.open(gdir .. "/crlf", "wb")); h:write("a\r\nb\r\n"); h:close()
+  h = assert(io.open(gdir .. "/big", "wb")); h:write(string.rep("0123456789abcdef\n", 60000)); h:close()
+  g({ "add", "." }); g({ "commit", "-qm", "it's \"quoted\" $HOME `x`" })
+  vim.fn.writefile({ "x" }, gdir .. "/new file")
+  local cmds = {
+    { "--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z" }, -- NULs
+    { "log", "--format=%h%x1f%s" },                                          -- quotes, $, backticks in output
+    { "show", "HEAD:crlf" },                                                 -- CRLF
+    { "show", "HEAD:big" },                                                  -- ~1MB, past any pipe buffer
+    { "show", "-s", "--format=%s", "@{upstream}" },                          -- fails (no upstream)
+    { "log", "--format=it's %s", "-1" },                                     -- ' in an argument
+    { "stash", "list" },                                                     -- empty
+  }
+  local root = t.S.root
+  t.S.root = gdir
+  local function run(script)
+    petal._batch_sh = script
+    local res
+    t.git_batch(cmds, function(r) res = r end)
+    assert(vim.wait(10000, function() return res ~= nil end, 5), "git_batch never answered")
+    petal._batch_sh = nil
+    return res
+  end
+  for _, mode in ipairs({ "batched", "fallback" }) do
+    local res = run(mode == "fallback" and "exit 3" or nil) -- the batch failing -> one spawn per command
+    for i, args in ipairs(cmds) do
+      local want = vim.system(vim.list_extend({ "git" }, args), { cwd = gdir, text = true }):wait()
+      eq(res[i].code, want.code, mode .. " code " .. args[1])
+      eq(res[i].stdout, want.stdout, mode .. " stdout " .. table.concat(args, " "))
+    end
+  end
+  t.S.root = root
+  vim.fn.delete(gdir, "rf")
+end)
+
 test("parse_diff: split lines give the same result as the joined text", function()
   local bdir = vim.fn.tempname()
   vim.fn.mkdir(bdir, "p")

@@ -173,13 +173,67 @@ local function git(args, opts, cb)
       if cb then cb(r) end
     end)
   -- a missing executable (no gh installed) throws ENOENT here: report it as a normal failed result
-  local ok, err = pcall(vim.system, cmd, { cwd = S.root, text = true, env = env, stdin = opts.stdin, detach = true }, on_exit)
+  local ok, err = pcall(vim.system, cmd, { cwd = S.root, text = opts.text ~= false, env = env, stdin = opts.stdin, detach = true }, on_exit)
   if not ok then
     local missing = vim.fn.executable(cmd[1]) == 0
     on_exit({ code = 127, signal = 0, stdout = "", stderr = missing
       and (cmd[1] .. " not found" .. (cmd[1] == "gh" and ": install it from https://cli.github.com" or ""))
       or tostring(err) })
   end
+end
+
+-- several read-only git commands in ONE process: sh forks them in parallel, each writing its stdout
+-- and exit code to a file in a dir nvim made, then Lua reads the files. A spawn costs nvim's main
+-- loop ~1ms (fork/exec of a big process) whatever git then does, so a refresh's 8+ spawns were
+-- nearly all of its blocking time. The script uses only builtins: no mktemp/cat/wc per command.
+-- cb(results): { code, stdout } per command, stdout normalized as text mode does; stderr dropped
+-- (no caller reads it). If anything goes wrong, each command falls back to its own spawn
+local BATCH_SH = [[
+d=$1; shift; i=0
+for c in "$@"; do i=$((i+1)); (eval "$c" >"$d/$i" 2>/dev/null; echo $? >"$d/$i.c") & done
+wait
+]]
+local function shquote(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+local function slurp(p)
+  local h = io.open(p, "rb")
+  if not h then return nil end
+  local v = h:read("*a")
+  h:close()
+  return v
+end
+local function git_batch(cmds, cb)
+  local function fallback(res)
+    local left = #cmds
+    for i, args in ipairs(cmds) do
+      git(args, nil, function(x)
+        res[i], left = x, left - 1
+        if left == 0 then cb(res) end
+      end)
+    end
+  end
+  local dir = vim.fn.tempname() -- inside nvim's own temp dir, which nvim removes on exit
+  if not vim.uv.fs_mkdir(dir, 448) then return fallback({}) end
+  local argv = { "sh", "-c", M._batch_sh or BATCH_SH, "petal", dir }
+  for _, args in ipairs(cmds) do
+    local q = { "git" }
+    for _, a in ipairs(args) do q[#q + 1] = shquote(a) end
+    argv[#argv + 1] = table.concat(q, " ")
+  end
+  git(nil, { raw = argv, text = false }, function(r)
+    local res = {}
+    for i = 1, #cmds do
+      local p = dir .. "/" .. i
+      local out, code = slurp(p), tonumber(vim.trim(slurp(p .. ".c") or ""))
+      os.remove(p)
+      os.remove(p .. ".c")
+      if r.code == 0 and out and code then res[i] = { code = code, stdout = (out:gsub("\r\n", "\n")) } end
+    end
+    vim.uv.fs_rmdir(dir)
+    local n = 0
+    for _ in pairs(res) do n = n + 1 end
+    if n == #cmds then return cb(res) end
+    fallback({})
+  end)
 end
 
 -- read-only buffer in this window; q goes back one step (log -> show -> q -> log, cursor kept)
@@ -496,6 +550,9 @@ local function paint(buf, L, H)
   while p < #old and p < #L and old[p + 1] == L[p + 1] do p = p + 1 end
   while s < #old - p and s < #L - p and old[#old - s] == L[#L - s] do s = s + 1 end
   if p == #old and p == #L then return end -- identical: keep lines and highlights
+  -- drop the replaced lines' marks first: deleted lines would pile them onto row p, and moving then
+  -- clearing 50k of those (collapsing a big diff) was ~40ms
+  vim.api.nvim_buf_clear_namespace(buf, ns, p, #old - s)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, p, #old - s, false, vim.list_slice(L, p + 1, #L - s))
   vim.bo[buf].modifiable = false
@@ -1074,21 +1131,8 @@ function M.refresh()
   local buf = S.buf
   if not (S.root and buf and vim.api.nvim_buf_is_valid(buf)) then return end
   S.seq, S.refreshed = S.seq + 1, vim.uv.hrtime()
-  local seq, d, diffs, pending = S.seq, {}, {}, 0
-  local function step(args, fn)
-    pending = pending + 1
-    git(args, nil, function(r)
-      if seq ~= S.seq then return end
-      fn(r)
-      pending = pending - 1
-      if pending > 0 then return end
-      d.radar = S.data and S.data.radar -- shown until the new check answers: no flicker
-      S.data, S.diffs = d, diffs
-      render()
-      if #d.remotes > 0 then pr_line(d.st.head) end
-      radar(d)
-    end)
-  end
+  local seq, d, diffs, steps = S.seq, {}, {}, {}
+  local function step(args, fn) steps[#steps + 1] = { args, fn } end
   local function ok(r) return r.code == 0 and vim.trim(r.stdout) or nil end
   step({ "--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z" }, function(r) d.st = parse_status(r.stdout) end)
   step({ "log", "--graph", "-n", tostring(C.recent), "--format=" .. LOGFMT }, function(r) d.recent = parse_log(r.stdout) end)
@@ -1144,6 +1188,15 @@ function M.refresh()
       end)
     end
   end
+  git_batch(vim.tbl_map(function(s) return s[1] end, steps), function(res)
+    if seq ~= S.seq then return end
+    for i, s in ipairs(steps) do s[2](res[i]) end
+    d.radar = S.data and S.data.radar -- shown until the new check answers: no flicker
+    S.data, S.diffs = d, diffs
+    render()
+    if #d.remotes > 0 then pr_line(d.st.head) end
+    radar(d)
+  end)
 end
 
 ---------------------------------------------------------------- applying changes
@@ -2719,9 +2772,14 @@ function M.open()
   end
   S.root, S.gitdir = root, gitdir
   -- repo-wide attribute files: when one exists, untracked diffs go through git (attrs_may_apply)
-  local af = vim.trim(vim.system({ "git", "config", "--path", "--get", "core.attributesFile" }, { cwd = root, text = true }):wait().stdout or "")
-  if af == "" then af = (vim.env.XDG_CONFIG_HOME or (vim.uv.os_homedir() .. "/.config")) .. "/git/attributes" end
-  S.attrs = vim.uv.fs_stat(gitdir .. "/info/attributes") ~= nil or vim.uv.fs_stat(af) ~= nil
+  -- async, not :wait() on open: until it answers, untracked diffs take the (always right) git path
+  S.attrs = true
+  git({ "config", "--path", "--get", "core.attributesFile" }, nil, function(r)
+    if S.root ~= root then return end
+    local af = vim.trim(r.stdout or "")
+    if af == "" then af = (vim.env.XDG_CONFIG_HOME or (vim.uv.os_homedir() .. "/.config")) .. "/git/attributes" end
+    S.attrs = vim.uv.fs_stat(gitdir .. "/info/attributes") ~= nil or vim.uv.fs_stat(af) ~= nil
+  end)
   S.pr_at = {} -- opening always rechecks the PR
 
   if not (S.buf and vim.api.nvim_buf_is_valid(S.buf)) then
@@ -2871,7 +2929,7 @@ M._t = {
     for _, g in ipairs(KEYS) do for _, k in ipairs(g[2]) do t[k[2]] = true end end
     return t
   end,
-  bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, lines = lines, untracked_diff = untracked_diff, hunk_owner = hunk_owner, parse_conflicts = parse_conflicts,
+  bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, git_batch = git_batch, paint = paint, ns = ns, untracked_diff = untracked_diff, hunk_owner = hunk_owner, parse_conflicts = parse_conflicts,
   parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary, failure = failure, cut = cut, refchunks = refchunks, S = S,
 }
 
