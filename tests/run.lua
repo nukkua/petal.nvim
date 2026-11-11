@@ -223,6 +223,26 @@ test("mappings: default, drop, add, rebind", function()
   eq(keys.x, "discard")
 end)
 
+test("simple: core keys only, mappings can add the rest back", function()
+  local function keys()
+    local t_ = {}
+    for _, g in ipairs(t.bindings()) do for _, k in ipairs(g[2]) do t_[k[1]] = k[2] end end
+    return t_
+  end
+  petal.setup({ simple = true })
+  local k = keys()
+  eq(k.c, "commit")
+  eq(k.s, "stage")
+  eq(k.P, "push")
+  eq(k.O, nil)
+  eq(k.a, nil)
+  eq(k.r, nil)
+  petal.setup({ simple = true, mappings = { r = "rebase" } })
+  eq(keys().r, "rebase")
+  petal.setup({ simple = false, mappings = {} })
+  eq(keys().O, "pr")
+end)
+
 test("mappings: every action name is unique", function()
   local seen = {}
   for _, g in ipairs(t.bindings()) do

@@ -40,6 +40,7 @@ are moved to `.git/petal-trash/` instead of being deleted.
     commit_suggest = nil,
     mappings = {},
     watch = true,
+    simple = false,
   })
 <
 Options are merged one level deep: a list or table you pass replaces the
@@ -77,6 +78,15 @@ watch                                                      *petal-opt-watch*
   with a tracked or untracked file is watched (up to 1000; past that only
   the git dir, so commits and staging still show). `false`: refresh only on
   open, |BufWritePost|, |FocusGained| and `<C-r>`.
+
+simple                                                    *petal-opt-simple*
+  `true`: petal as plain as it gets, a status buffer with the core keys.
+  Off in this mode: the PR line and every `gh` call from the status, the
+  conflict radar, the background fetch on open, |petal-opt-watch| and the
+  file summary under the commit buffer. Default keys left: `c b f p P l Z`
+  (commit, branch, fetch, pull, push, log, stash), `s S <C-s> u U x`, `d e`,
+  `<C-r> <CR>`, the folds, `?` and `q`. Every other action can still be
+  bound with |petal-mappings|, e.g. `mappings = { r = "rebase" }`.
 
 ==============================================================================
 3. USAGE                                                         *petal-usage*

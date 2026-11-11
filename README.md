@@ -34,10 +34,18 @@ require("petal").setup({
   commit_suggest = nil,                                -- agent that suggests commit messages, see below
   mappings = {},                                       -- status keys, see below
   watch = true,                                        -- refresh when the repo changes outside nvim
+  simple = false,                                      -- core status and keys only, see below
 })
 
 vim.keymap.set("n", "<leader>gg", "<cmd>Petal<cr>", { desc = "Git status" })
 ```
+
+## Simple mode
+
+`simple = true` keeps petal plain: the status buffer and the core keys (`c b f p P l Z`,
+`s S <c-s> u U x`, `d e`, folds, `?`, `q`). It turns off the PR line and `gh` calls, the conflict
+radar, the background fetch on open, the file watcher and the summary under the commit buffer.
+You can still bind any other action yourself, e.g. `mappings = { r = "rebase" }`.
 
 ## Usage
 

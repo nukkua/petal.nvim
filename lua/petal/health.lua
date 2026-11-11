@@ -37,6 +37,7 @@ function M.check()
   else
     h.ok("commit_suggest: " .. cs[1])
   end
+  if C.simple then h.info("simple mode: PR line, conflict radar, background fetch, watcher and extra keys are off") end
   if type(C.mappings) ~= "table" then return h.error("mappings must be a table") end
   local names, bad = t.actions(), {}
   for key, name in pairs(C.mappings) do

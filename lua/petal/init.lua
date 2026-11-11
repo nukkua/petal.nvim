@@ -16,6 +16,8 @@ local C = {
                                                        -- <c-c><c-y> accepts and commits
   mappings = {},                                       -- status keys: { [key] = action name | false }, see :h petal-mappings
   watch = true,                                        -- refresh the open status when the repo changes on disk
+  simple = false,                                      -- just status + core keys: no PR line, conflict radar,
+                                                       -- background fetch, watcher or commit summary, see :h petal-opt-simple
 }
 local BIND
 function M.setup(opts) -- shallow: list options replace, not merge
@@ -774,7 +776,7 @@ local function render(focus)
     if f then f:close() end
     S.pr = ok and type(t) == "table" and t or {}
   end
-  local pr = S.pr[S.root .. "\0" .. head] or (HAS_GH and #d.remotes > 0 and { { { "loading…", "Comment" } } })
+  local pr = not C.simple and (S.pr[S.root .. "\0" .. head] or (HAS_GH and #d.remotes > 0 and { { { "loading…", "Comment" } } }))
   for i, chunks in ipairs(pr or {}) do add(cat({ { i == 1 and "PR:       " or "          ", sub } }, chunks)) end
   for _, x in ipairs(d.radar or {}) do
     local fs = x.files
@@ -1206,6 +1208,7 @@ function M.refresh()
     d.radar = S.data and S.data.radar -- shown until the new check answers: no flicker
     S.data, S.diffs = d, diffs
     render()
+    if C.simple then return end
     if #d.remotes > 0 then pr_line(d.st.head) end
     radar(d)
   end)
@@ -2611,6 +2614,11 @@ end
 local function with(fn) return function() fn(context()) end end
 
 local KEYS
+-- the default keys simple mode keeps; any other action can still be bound through C.mappings
+local SIMPLE = { commit = true, branch = true, fetch = true, pull = true, push = true, log = true, stash = true,
+  stage = true, stage_all = true, stage_unstaged = true, unstage = true, unstage_all = true, discard = true,
+  diff = true, merge_mode = true, refresh = true, ["goto"] = true, toggle_fold = true, open_fold = true,
+  close_fold = true, open_all = true, close_all = true, help = true, close = true }
 
 -- KEYS with C.mappings applied: { key = false } drops a key, { key = "action" } binds it (replacing its default)
 local function bindings()
@@ -2621,7 +2629,7 @@ local function bindings()
     local list = {}
     for _, k in ipairs(g[2]) do
       by[k[2]] = gi
-      if map[k[1]] == nil then list[#list + 1] = k end
+      if map[k[1]] == nil and (not C.simple or SIMPLE[k[2]]) then list[#list + 1] = k end
     end
     BIND[gi] = { g[1], list }
   end
@@ -2747,7 +2755,7 @@ local function watch(dir)
 end
 
 function watch_sync()
-  if not C.watch or not S.root then return unwatch_all() end
+  if not C.watch or C.simple or not S.root then return unwatch_all() end
   local root, gitdir = S.root, S.gitdir
   git({ "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--directory" }, nil, function(r)
     if root ~= S.root or r.code ~= 0 then return end
@@ -2824,7 +2832,7 @@ function M.open()
     M.refresh()
   end
   watch_sync()
-  fetch_bg()
+  if not C.simple then fetch_bg() end
 end
 
 -- runs C.commit_suggest on the staged diff as soon as the commit buffer opens; the result shows as
@@ -2904,7 +2912,7 @@ function M.edit(path, index, amend)
       diff = cat(index and index ~= "" and { "env", "GIT_INDEX_FILE=" .. index } or {}, { "git", "diff", "--cached" }, base and { base } or {})
     end
     -- the changes being committed go in the window below: a summary of the files (+/−), za expands one
-    if diff then show("to commit", { diff = diff, win = below, summary = true }) end
+    if diff and not C.simple then show("to commit", { diff = diff, win = below, summary = true }) end
     local written = false
     vim.api.nvim_create_autocmd("BufWritePost", { buffer = buf, callback = function() written = true end })
     vim.api.nvim_create_autocmd("BufUnload", { buffer = buf, once = true, callback = function()
