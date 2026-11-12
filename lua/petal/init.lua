@@ -17,7 +17,7 @@ local C = {
   mappings = {},                                       -- status keys: { [key] = action name | false }, see :h petal-mappings
   watch = true,                                        -- refresh the open status when the repo changes on disk
   simple = false,                                      -- just status + core keys: no PR line, conflict radar,
-                                                       -- background fetch, watcher or commit summary, see :h petal-opt-simple
+                                                       -- background fetch, watcher or commit/pull summary, see :h petal-opt-simple
 }
 local BIND
 function M.setup(opts) -- shallow: list options replace, not merge
@@ -2386,6 +2386,25 @@ function P.merge()
     } })
 end
 
+-- pull, then show what came in as the commit view's file summary (+/−, za expands one)
+-- instead of git's diffstat; nothing new (or an unborn HEAD) keeps git's own message
+local function pull(args)
+  git({ "rev-parse", "-q", "--verify", "HEAD" }, nil, function(h)
+    local old = h.code == 0 and vim.trim(h.stdout or "") or nil
+    act(args, { msg = "Pulling", after = function(r)
+      git({ "rev-parse", "-q", "--verify", "HEAD" }, nil, function(n)
+        local new = n.code == 0 and vim.trim(n.stdout or "") or nil
+        if old and new and old ~= new and not C.simple then
+          notify(("pulled %s..%s"):format(old:sub(1, 7), new:sub(1, 7)))
+          return show(old:sub(1, 7) .. ".." .. new:sub(1, 7), { diff = { "git", "diff", old, new }, summary = true })
+        end
+        local out = vim.trim((r.stdout or "") .. "\n" .. (r.stderr or ""))
+        if out ~= "" then output(out) end
+      end)
+    end })
+  end)
+end
+
 function P.pull()
   fetch_bg()
   local up = S.data and S.data.st.upstream
@@ -2393,7 +2412,7 @@ function P.pull()
     refs({ "refs/remotes" }, function(l)
       pick("Pull from", l, function(b)
         local r, br = b:match("^([^/]+)/(.+)$")
-        act(cat({ "pull" }, a, { r, br }), { msg = "Pulling", show = true })
+        pull(cat({ "pull" }, a, { r, br }))
       end)
     end)
   end
@@ -2402,7 +2421,7 @@ function P.pull()
     groups = { { "Pull into " .. (S.data and S.data.st.head or "HEAD") .. " from", {
       { "p", up or "upstream (pick)", function(a)
         fetch_bg(function()
-          if up then act(cat({ "pull" }, a), { msg = "Pulling", show = true }) else elsewhere(a) end
+          if up then pull(cat({ "pull" }, a)) else elsewhere(a) end
         end)
       end },
       { "e", "Elsewhere", function(a) fetch_bg(function() elsewhere(a) end) end },
