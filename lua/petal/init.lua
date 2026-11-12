@@ -17,7 +17,7 @@ local C = {
   mappings = {},                                       -- status keys: { [key] = action name | false }, see :h petal-mappings
   watch = true,                                        -- refresh the open status when the repo changes on disk
   simple = false,                                      -- just status + core keys: no PR line, conflict radar,
-                                                       -- background fetch, watcher or commit/pull summary, see :h petal-opt-simple
+                                                       -- background fetch, watcher or commit summary, see :h petal-opt-simple
 }
 local BIND
 function M.setup(opts) -- shallow: list options replace, not merge
@@ -2394,7 +2394,7 @@ local function pull(args)
     act(args, { msg = "Pulling", after = function(r)
       git({ "rev-parse", "-q", "--verify", "HEAD" }, nil, function(n)
         local new = n.code == 0 and vim.trim(n.stdout or "") or nil
-        if old and new and old ~= new and not C.simple then
+        if old and new and old ~= new then
           notify(("pulled %s..%s"):format(old:sub(1, 7), new:sub(1, 7)))
           return show(old:sub(1, 7) .. ".." .. new:sub(1, 7), { diff = { "git", "diff", old, new }, summary = true })
         end

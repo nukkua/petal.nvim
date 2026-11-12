@@ -83,11 +83,10 @@ simple                                                    *petal-opt-simple*
   `true`: petal as plain as it gets, a status buffer with the core keys.
   Off in this mode: the PR line and every `gh` call from the status, the
   conflict radar, the background fetch on open, |petal-opt-watch| and the
-  file summary under the commit buffer and after a pull. Default keys
-  left: `c b f p P l Z` (commit, branch, fetch, pull, push, log, stash),
-  `s S <C-s> u U x`, `d e`, `<C-r> <CR>`, the folds, `?` and `q`. Every
-  other action can still be bound with |petal-mappings|, e.g.
-  `mappings = { r = "rebase" }`.
+  file summary under the commit buffer. Default keys left: `c b f p P l Z`
+  (commit, branch, fetch, pull, push, log, stash), `s S <C-s> u U x`, `d e`,
+  `<C-r> <CR>`, the folds, `?` and `q`. Every other action can still be
+  bound with |petal-mappings|, e.g. `mappings = { r = "rebase" }`.
 
 ==============================================================================
 3. USAGE                                                         *petal-usage*
