@@ -516,6 +516,217 @@ test("watch: changes made outside nvim refresh the open status", function()
   vim.fn.delete(wdir, "rf")
 end)
 
+-- performance guards: what a refresh must NOT redo. spawned() counts git processes by subcommand
+local function repo(name)
+  local d = vim.fn.tempname()
+  vim.fn.mkdir(d, "p")
+  local function g(args)
+    local r = vim.system(vim.list_extend({ "git" }, args), { cwd = d, text = true }):wait()
+    assert(r.code == 0, table.concat(args, " ") .. ": " .. (r.stderr or ""))
+    return r.stdout
+  end
+  g({ "init", "-q", "-b", "main" })
+  for k, v in pairs({ ["user.name"] = "t", ["user.email"] = "t@t", ["commit.gpgsign"] = "false", ["core.hooksPath"] = "/dev/null" }) do g({ "config", k, v }) end
+  return d, g
+end
+local function spy()
+  local counts, real = {}, vim.system
+  vim.system = function(cmd, ...)
+    local s = table.concat(cmd, " ")
+    for _, w in ipairs({ "merge-tree", "ls-files" }) do if s:find(w, 1, true) then counts[w] = (counts[w] or 0) + 1 end end
+    return real(cmd, ...)
+  end
+  return counts, function() vim.system = real end
+end
+local function settled(ms) -- refreshes and their follow-ups done
+  local seq = t.S.seq
+  vim.wait(ms or 400, function() return false end, 20)
+  return seq
+end
+local function shown(pat) return vim.wait(3000, function() return vim.fn.search(pat, "nw") > 0 end, 10) end
+
+test("refresh: an unchanged diff keeps its object and rows; a file that left its section stops being diffed", function()
+  local rdir, g = repo()
+  vim.fn.writefile({ "a1", "a2" }, rdir .. "/a.txt")
+  vim.fn.writefile({ "b1" }, rdir .. "/b.txt")
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  petal.open()
+  assert(vim.wait(3000, function() return t.S.data and #t.S.data.st.untracked == 2 end, 10), "status never rendered")
+  for _, f in ipairs(t.S.data.st.untracked) do t.S.open["untracked:" .. f.path] = f end
+  petal.refresh()
+  assert(shown("^+a2$") and shown("^+b1$"), "diffs not expanded")
+  local a = t.S.diffs["untracked:a.txt"]
+  assert(a.seg, "render cached no rows for a.txt")
+  vim.fn.writefile({ "b1", "b2" }, rdir .. "/b.txt")
+  petal.refresh()
+  assert(shown("^+b2$"), "changed diff not redrawn")
+  assert(t.S.diffs["untracked:a.txt"] == a, "unchanged diff was rebuilt")
+  -- highlights of the copied rows still land on the right lines
+  local row = vim.fn.search("^+b2$", "nw") - 1
+  local marks = vim.api.nvim_buf_get_extmarks(t.S.buf, t.ns, { row, 0 }, { row, -1 }, { details = true })
+  eq(marks[1] and marks[1][4].hl_group, "GitDiffAdd")
+  g({ "add", "a.txt" })
+  petal.refresh()
+  assert(shown("^Staged"), "staged section missing")
+  settled()
+  eq(t.S.open["untracked:a.txt"], nil, "a.txt left Untracked but is still expanded there")
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+end)
+
+test("radar: merge-tree runs again only when HEAD or the target moved", function()
+  local rdir, g = repo()
+  vim.fn.writefile({ "base" }, rdir .. "/r.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "base" })
+  g({ "branch", "up" })
+  vim.fn.writefile({ "ours" }, rdir .. "/r.txt"); g({ "commit", "-qam", "ours" })
+  g({ "switch", "-q", "up" }); vim.fn.writefile({ "theirs" }, rdir .. "/r.txt"); g({ "commit", "-qam", "theirs" })
+  g({ "switch", "-q", "main" }); g({ "branch", "-q", "-u", "up" })
+  local counts, restore = spy()
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  local ok, err = pcall(function()
+    petal.open()
+    assert(shown("^Conflict: up"), "radar never reported the conflict")
+    settled()
+    local n = counts["merge-tree"]
+    petal.refresh(); settled(); petal.refresh(); settled()
+    eq(counts["merge-tree"], n, "merge-tree reran with HEAD and up unchanged")
+    assert(shown("^Conflict: up"), "cached conflict not shown")
+    vim.fn.writefile({ "ours 2" }, rdir .. "/r.txt"); g({ "commit", "-qam", "ours 2" })
+    petal.refresh(); settled()
+    eq(counts["merge-tree"], n + 1, "HEAD moved: merge-tree should rerun")
+  end)
+  restore()
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+  assert(ok, err)
+end)
+
+test("watch: a plain edit refreshes without re-listing directories", function()
+  local rdir, g = repo()
+  vim.fn.mkdir(rdir .. "/sub", "p")
+  vim.fn.writefile({ "a" }, rdir .. "/sub/a.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "base" })
+  local counts, restore = spy()
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  local ok, err = pcall(function()
+    petal.open()
+    assert(shown("Recent"), "status never rendered")
+    vim.wait(1000, function() return t.S.watch[rdir .. "/sub"] ~= nil end, 10)
+    settled(600)
+    local n = counts["ls-files"]
+    vim.fn.writefile({ "b" }, rdir .. "/sub/a.txt")
+    assert(shown("sub/a.txt"), "edit not picked up")
+    settled(600)
+    eq(counts["ls-files"], n, "an edit re-listed the worktree")
+    vim.fn.mkdir(rdir .. "/new", "p")
+    vim.fn.writefile({ "x" }, rdir .. "/new/x.txt")
+    assert(shown("new/"), "new directory not picked up")
+    vim.wait(1000, function() return counts["ls-files"] > n end, 10)
+    assert(counts["ls-files"] > n, "a new directory should re-list")
+  end)
+  restore()
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+  assert(ok, err)
+end)
+
+test("resize: only a width change of the status window re-renders", function()
+  local rdir, g = repo()
+  vim.fn.writefile({ "a" }, rdir .. "/a.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "base" })
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  petal.open()
+  assert(shown("Recent"), "status never rendered")
+  settled()
+  local renders, real = 0, vim.api.nvim_buf_get_lines
+  vim.api.nvim_buf_get_lines = function(b, ...) if b == t.S.buf then renders = renders + 1 end return real(b, ...) end
+  local ok, err = pcall(function()
+    vim.api.nvim_exec_autocmds("WinResized", {}) -- first event sets the width
+    local n = renders
+    vim.cmd("split | wincmd p | resize 5") -- a height change, and another window
+    vim.api.nvim_exec_autocmds("WinResized", {})
+    eq(renders, n, "height change re-rendered")
+    vim.cmd("only | vsplit")
+    vim.api.nvim_exec_autocmds("WinResized", {})
+    assert(renders > n, "width change did not re-render")
+    vim.cmd("only")
+  end)
+  vim.api.nvim_buf_get_lines = real
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+  assert(ok, err)
+end)
+
+test("amend summary: diffs against HEAD^, or the empty tree on the root commit", function()
+  local rdir, g = repo()
+  vim.fn.writefile({ "a" }, rdir .. "/root.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "root" })
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  petal.open()
+  assert(shown("Recent"), "status never rendered")
+  local function summary(name)
+    local path = rdir .. "/.git/COMMIT_EDITMSG"
+    vim.fn.writefile({ "" }, path)
+    petal.edit(path, "", true)
+    local b
+    vim.wait(3000, function()
+      for _, x in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_get_name(x):match("git://diff to commit$") and table.concat(vim.api.nvim_buf_get_lines(x, 0, -1, false), "\n"):find(name, 1, true) then b = x end
+      end
+      return b ~= nil
+    end, 10)
+    vim.cmd("stopinsert | bwipeout!")
+    return b ~= nil
+  end
+  assert(summary("root.txt"), "root amend: summary missing root.txt (vs empty tree)")
+  vim.fn.writefile({ "b" }, rdir .. "/two.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "two" })
+  assert(summary("two.txt"), "amend: summary missing two.txt (vs HEAD^)")
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+end)
+
+test("d and e open their views once git answers (no blocking calls)", function()
+  local rdir, g = repo()
+  vim.fn.writefile({ "base" }, rdir .. "/m.txt")
+  vim.fn.writefile({ "head" }, rdir .. "/v.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "base" })
+  g({ "switch", "-qc", "other" }); vim.fn.writefile({ "theirs" }, rdir .. "/m.txt"); g({ "commit", "-qam", "theirs" })
+  g({ "switch", "-q", "main" }); vim.fn.writefile({ "ours" }, rdir .. "/m.txt"); g({ "commit", "-qam", "ours" })
+  vim.system({ "git", "merge", "other" }, { cwd = rdir }):wait() -- conflicts on m.txt
+  vim.fn.writefile({ "work" }, rdir .. "/v.txt")
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  petal.open()
+  assert(shown("v%.txt") or shown("v.txt"), "status never rendered")
+  vim.fn.cursor(vim.fn.search("modified.*v\\.txt", "nw"), 1)
+  vim.api.nvim_feedkeys("d", "x", false)
+  local head = vim.fn.bufnr("HEAD:v.txt")
+  vim.wait(3000, function() head = vim.fn.bufnr("HEAD:v.txt"); return head ~= -1 end, 10)
+  assert(head ~= -1, "d: no HEAD side")
+  eq(vim.api.nvim_buf_get_lines(head, 0, -1, false), { "head" })
+  vim.cmd("diffoff! | only")
+  petal.open()
+  assert(shown("unmerged.*m.txt"), "conflict not listed")
+  vim.fn.cursor(vim.fn.search("unmerged.*m\\.txt", "nw"), 1)
+  local tabs = #vim.api.nvim_list_tabpages()
+  vim.api.nvim_feedkeys("e", "x", false)
+  assert(vim.wait(3000, function() return #vim.api.nvim_tabpage_list_wins(0) == 3 end, 10), "e: merge windows never opened")
+  assert(#vim.api.nvim_list_tabpages() == tabs + 1, "e: no merge tab")
+  local bars = {}
+  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do bars[#bars + 1] = vim.wo[w].winbar end
+  assert(table.concat(bars, "\n"):find("ours  main", 1, true), "e: ours label missing: " .. table.concat(bars, " | "))
+  vim.cmd("diffoff! | tabclose")
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+end)
+
 vim.fn.delete(dir, "rf")
 print(("%d/%d passed"):format(n - fails, n))
 os.exit(fails > 0 and 1 or 0)
