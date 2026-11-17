@@ -262,6 +262,7 @@ local function scratch(name, ft, text)
   vim.bo[buf].filetype = ft
   pcall(vim.api.nvim_buf_set_name, buf, "git://" .. name)
   vim.api.nvim_win_set_buf(0, buf)
+  vim.wo[0][0].number = true -- buffer-local in this window: the user's own buffers keep their setting
   vim.keymap.set("n", "q", function()
     local back = vim.api.nvim_buf_is_valid(prev) and prev or S.buf
     if back and vim.api.nvim_buf_is_valid(back) then vim.api.nvim_win_set_buf(0, back) end
@@ -2285,7 +2286,7 @@ local function popup(def)
 
   draw()
   win = vim.api.nvim_open_win(buf, true, { split = "below", win = -1, height = C.height })
-  for o, v in pairs({ number = false, relativenumber = false, signcolumn = "no", cursorline = false,
+  for o, v in pairs({ number = true, relativenumber = false, signcolumn = "no", cursorline = false,
     winfixheight = true, list = false, foldcolumn = "0" }) do
     vim.wo[win][o] = v
   end
@@ -2954,7 +2955,10 @@ function M.open()
     vim.bo[S.buf].modifiable = false
     M.maps(S.buf)
     -- BufWinEnter, not BufEnter: coming back from a popup/picker window is not a reason to refresh
-    vim.api.nvim_create_autocmd("BufWinEnter", { buffer = S.buf, callback = function() M.refresh() end })
+    vim.api.nvim_create_autocmd("BufWinEnter", { buffer = S.buf, callback = function()
+      vim.wo[0][0].number = true
+      M.refresh()
+    end })
     vim.api.nvim_create_autocmd("BufWipeout", { buffer = S.buf, callback = unwatch_all })
     -- group cleared: a wiped and recreated status buffer must not stack another set of global handlers
     local aug, queued = vim.api.nvim_create_augroup("petal_status", { clear = true }), false
