@@ -191,14 +191,18 @@ one `gh pr list`, rechecked like the PR line and after a manual fetch).
 remote branch it creates the local tracking branch. `q` closes.
 
 The local list is a buffer you edit like text (oil-style); `:w` applies:
-  `dd`        delete (an unmerged branch asks to force); then, if it has an
-            upstream, asks to delete that on the remote too. Never offered
-            for the remote's default branch, |petal-opt-base_branches|, or
-            an upstream another branch still tracks
+  `dd`        delete; a branch's upstream is deleted on the remote too
+            (unless you pick "Local only"). Never the remote's default
+            branch, |petal-opt-base_branches|, or an upstream another branch
+            still tracks
   `yy` `p`    copy: the pasted line, renamed, becomes a branch at that commit
   `cw` `cc`   rename (`branch -m`, keeps upstream and reflog)
   `o`         a new line creates a branch at HEAD
-Every save lists what it will do and asks first. Refused: deleting the
+Every save asks once, before anything runs: the dialog lists each change,
+flags branches that aren't merged (their commits will be lost), and which
+upstreams go too: Apply + remote, Local only, or Cancel. Then the local
+deletes run as one `git branch -D`, and the remote ones as one
+`git push --delete` per remote in the background. Refused: deleting the
 checked-out branch, a name listed twice, a name that already exists (swap
 names in two saves), `<remote>/…` names, and invalid names. The first failing
 step stops the rest; the list then reloads to show what was done. <CR> and

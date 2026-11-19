@@ -752,7 +752,7 @@ test("branch_plan: dd deletes, yy+p copies, edit renames, new line creates, edge
   eq(ops({ "/1 main", "/2 origin/feat", "/3 gone" }), "origin/feat looks like a remote branch (remote branches: b R)")
 end)
 
-test("branches buffer: :w deletes, renames, copies, creates; unmerged delete asks", function()
+test("branches buffer: :w deletes, renames, copies, creates; one dialog flags unmerged", function()
   local rdir, g = repo()
   vim.fn.writefile({ "x" }, rdir .. "/x.txt")
   g({ "add", "." }); g({ "commit", "-qm", "x" })
@@ -763,22 +763,23 @@ test("branches buffer: :w deletes, renames, copies, creates; unmerged delete ask
   petal.open()
   assert(vim.wait(3000, function() return t.S.data end, 10), "status never rendered")
   local real, asked = vim.fn.confirm, {}
-  vim.fn.confirm = function(msg) asked[#asked + 1] = msg; return msg:find("not fully merged") and 2 or 1 end
+  vim.fn.confirm = function(msg) asked[#asked + 1] = msg; return 1 end
   t.branches("local")
   local buf = vim.api.nvim_get_current_buf()
   assert(vim.wait(3000, function() return vim.api.nvim_buf_line_count(buf) == 4 end, 10), "branch list never loaded")
   local id = {}
   for _, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do id[l:match("^/%d+ (.*)$")] = l:match("^(/%d+ )") end
-  -- gone + unmerged dropped (unmerged: force declined, so it stays), feat renamed + copied, fresh new
+  -- gone + unmerged dropped, feat renamed + copied, fresh new
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { id.main .. "main", id.feat .. "renamed", id.feat .. "copy", "fresh" })
   vim.cmd("write")
-  assert(vim.wait(5000, function() return not vim.bo[buf].modified and vim.api.nvim_buf_line_count(buf) == 5 end, 20), "save never finished")
+  assert(vim.wait(5000, function() return not vim.bo[buf].modified and vim.api.nvim_buf_line_count(buf) == 4 end, 20), "save never finished")
   vim.fn.confirm = real
   local loc = vim.split(vim.trim(g({ "for-each-ref", "--format=%(refname:short)", "refs/heads" })), "\n")
   table.sort(loc)
-  eq(loc, { "copy", "fresh", "main", "renamed", "unmerged" })
+  eq(loc, { "copy", "fresh", "main", "renamed" })
   assert(asked[1]:find("rename  feat → renamed", 1, true), "summary: " .. asked[1])
-  assert(asked[2] and asked[2]:find("unmerged is not fully merged", 1, true), "no force prompt")
+  assert(asked[1]:find("delete  unmerged  (not merged", 1, true) and not asked[1]:find("gone  (not merged", 1, true), "merge state: " .. asked[1])
+  eq(#asked, 1, "more than one dialog")
   vim.cmd("normal q")
   vim.cmd.cd(cwd)
   vim.fn.delete(rdir, "rf")
@@ -815,11 +816,15 @@ test("branches: deleting asks to delete the upstream, never the default or a sha
   assert(vim.wait(5000, function() return not vim.bo[buf].modified and vim.api.nvim_buf_line_count(buf) == 2 end, 20), "save never finished")
   vim.fn.confirm = real
   local function has(p) for _, m in ipairs(asked) do if m:find(p, 1, true) then return true end end end
-  assert(has("Also delete feat on origin?"), "no upstream prompt: " .. vim.inspect(asked))
-  assert(not has("delete main on origin") and not has("delete twin on origin"), "offered a protected upstream: " .. vim.inspect(asked))
-  local rem = vim.split(vim.trim(vim.system({ "git", "for-each-ref", "--format=%(refname:short)" }, { cwd = bare, text = true }):wait().stdout), "\n")
-  table.sort(rem)
-  eq(rem, { "main", "twin" })
+  assert(has("on origin also delete: feat\n") or asked[1]:match("on origin also delete: feat$"), "upstream not offered: " .. vim.inspect(asked))
+  eq(#asked, 1, "more than one dialog")
+  local function rem()
+    local r = vim.split(vim.trim(vim.system({ "git", "for-each-ref", "--format=%(refname:short)" }, { cwd = bare, text = true }):wait().stdout), "\n")
+    table.sort(r)
+    return r
+  end
+  vim.wait(5000, function() return #rem() == 2 end, 50) -- the push runs in the background
+  eq(rem(), { "main", "twin" })
   vim.cmd("normal q")
   t.branches("remote")
   buf = vim.api.nvim_get_current_buf()

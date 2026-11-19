@@ -2400,27 +2400,11 @@ local function plan_line(op)
   return "create  " .. op.to .. " from " .. (op.src and op.src.name or "HEAD")
 end
 
--- one op; false stops the rest. Declining a force delete skips that branch only
+-- rename or create; deletes run batched in save(). false stops the rest
 local function branch_op(op, raw)
-  local o, r = op.src, nil
-  if op.op == "delete" then
-    r = raw({ "branch", "-d", o.name })
-    if r.code ~= 0 and (r.stderr or ""):find("not fully merged") then
-      if not confirm(o.name .. " is not fully merged. Force delete?") then return true end
-      r = raw({ "branch", "-D", o.name })
-    end
-    -- its upstream too, if asked: never the remote's default or a base branch, nor one still tracked
-    local up = o.upstream
-    if r.code == 0 and up and o.up_remote ~= "." and not o.gone and not op.shared then
-      local def = vim.trim(raw({ "symbolic-ref", "-q", "--short", "refs/remotes/" .. o.up_remote .. "/HEAD" }).stdout or "")
-      local b = o.up_ref:gsub("^refs/heads/", "")
-      if up ~= def and not vim.tbl_contains(C.base_branches, up) and confirm("Also delete " .. b .. " on " .. o.up_remote .. "? (can't be undone)") then
-        local p = raw({ "push", o.up_remote, "--delete", b })
-        if p.code ~= 0 then fail("delete " .. up, p) end -- the local delete is done: carry on
-      end
-    end
-  elseif op.op == "rename" then r = raw({ "branch", "-m", o.name, op.to }) -- -m keeps reflog and upstream
-  else r = raw({ "branch", op.to, o and o.sha or "HEAD" }) end -- copies use the sha loaded: order-proof
+  local o = op.src
+  local r = op.op == "rename" and raw({ "branch", "-m", o.name, op.to }) -- -m keeps reflog and upstream
+    or raw({ "branch", op.to, o and o.sha or "HEAD" }) -- copies use the sha loaded: order-proof
   if r.code ~= 0 then fail(plan_line(op), r) end
   return r.code == 0
 end
@@ -2532,16 +2516,48 @@ local function branches(kind)
     for _, op in ipairs(plan) do if op.op == "delete" then gone[op.src.id] = true end end
     for _, o in ipairs(orig) do if not gone[o.id] and o.upstream then used[o.upstream] = true end end
     for _, op in ipairs(plan) do if op.op == "delete" then op.shared = used[op.src.upstream] end end
+    -- every question up front in one dialog, then local work in one go and one push per remote
     job("branches", "", function(_, raw) -- no temp file: os.remove("") is a no-op
-      local text = {}
+      local text, dels, remote, defaults = {}, {}, {}, {}
       for _, op in ipairs(plan) do
         if op.to and raw({ "check-ref-format", "--branch", op.to }).code ~= 0 then
           return notify("branches: not a valid branch name: " .. op.to, vim.log.levels.WARN)
         end
-        text[#text + 1] = plan_line(op)
+        local line, o = plan_line(op), op.src
+        if op.op == "delete" then
+          dels[#dels + 1] = o.name
+          -- git branch -d's rule: merged into the upstream if it has one, else into HEAD
+          local into = o.upstream and not o.gone and o.upstream or "HEAD"
+          if raw({ "merge-base", "--is-ancestor", o.sha, into }).code ~= 0 then line = line .. "  (not merged: its commits will be lost)" end
+          -- its upstream too: never the remote's default or a base branch, nor one still tracked
+          local rm = o.up_remote
+          if o.upstream and rm ~= "." and not o.gone and not op.shared then
+            defaults[rm] = defaults[rm] or vim.trim(raw({ "symbolic-ref", "-q", "--short", "refs/remotes/" .. rm .. "/HEAD" }).stdout or "")
+            if o.upstream ~= defaults[rm] and not vim.tbl_contains(C.base_branches, o.upstream) then
+              remote[rm] = remote[rm] or {}
+              table.insert(remote[rm], (o.up_ref:gsub("^refs/heads/", "")))
+            end
+          end
+        end
+        text[#text + 1] = line
       end
-      if not confirm(table.concat(text, "\n")) then return end
-      for _, op in ipairs(plan) do if not branch_op(op, raw) then break end end
+      local rms = vim.tbl_keys(remote)
+      table.sort(rms)
+      for i, rm in ipairs(rms) do
+        text[#text + 1] = (i == 1 and "\n" or "") .. "on " .. rm .. " also delete: " .. table.concat(remote[rm], ", ")
+      end
+      local choice = vim.fn.confirm(table.concat(text, "\n"),
+        #rms > 0 and "&Apply + remote\n&Local only\n&Cancel" or "&Apply\n&Cancel", #rms > 0 and 3 or 2)
+      if not (choice == 1 or (#rms > 0 and choice == 2)) then return end
+      local r = #dels > 0 and raw(cat({ "branch", "-D" }, dels)) -- merge state was shown above: force
+      if r and r.code ~= 0 then fail("delete", r)
+      else
+        for _, op in ipairs(plan) do if op.op ~= "delete" and not branch_op(op, raw) then break end end
+        -- network last, in the background: the list is usable while it pushes
+        if choice == 1 then
+          for _, rm in ipairs(rms) do act(cat({ "push", rm, "--delete" }, remote[rm]), { msg = "Deleting on " .. rm }) end
+        end
+      end
       load()
       M.refresh()
     end)
