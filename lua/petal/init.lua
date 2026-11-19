@@ -2590,13 +2590,15 @@ end
 
 function P.fetch()
   local up = S.data and S.data.st.upstream and S.data.st.upstream:match("^[^/]+")
+  -- manual fetch: always recheck the PR (refresh skips gh for PR_TTL otherwise)
+  local fetched = { msg = "Fetching", show = true, after = function() S.pr_at = {} end }
   popup({ title = "Fetch",
     args = { { "p", "--prune", "Prune deleted branches" }, { "t", "--tags", "Fetch all tags" } },
     groups = { { "Fetch from", {
-      { "u", up or "upstream", function(a) if up then act(cat({ "fetch" }, a, { up }), { msg = "Fetching", show = true }) end end },
-      { "a", "All remotes", function(a) act(cat({ "fetch", "--all" }, a), { msg = "Fetching", show = true }) end },
+      { "u", up or "upstream", function(a) if up then act(cat({ "fetch" }, a, { up }), fetched) end end },
+      { "a", "All remotes", function(a) act(cat({ "fetch", "--all" }, a), fetched) end },
       { "e", "Elsewhere", function(a)
-        pick("Fetch", S.data.remotes, function(r) act(cat({ "fetch" }, a, { r }), { msg = "Fetching", show = true }) end)
+        pick("Fetch", S.data.remotes, function(r) act(cat({ "fetch" }, a, { r }), fetched) end)
       end },
     } },
     -- big repos: hourly prefetch + commit-graph, so the auto-fetch and log --graph stay instant
