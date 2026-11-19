@@ -184,7 +184,8 @@ existing text files move, and only in linear unpushed history.
 
                                                            *petal-branches*
 `b l` (local) and `b R` (remote) open the branches as a list at the bottom,
-newest first, each with its age, last subject and PR badge (`#12 open`, from
+newest first, the current branch (in `b R`: its upstream) tagged and the
+cursor on it, each with its age, last subject and PR badge (`#12 open`, from
 one `gh pr list`, rechecked like the PR line and after a manual fetch).
 <CR> switches to the branch under the cursor and closes the list; on a
 remote branch it creates the local tracking branch. `q` closes.

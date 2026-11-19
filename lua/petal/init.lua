@@ -2472,14 +2472,19 @@ local function branches(kind)
     for i, o in ipairs(orig) do
       local pr = prs and prs[o.pr_key]
       local s = pr and pr_state(pr)
+      -- tag column: blanks carry no highlight (an underlined Head group would draw them as __)
+      local tag = o.current and (edit and "● current" or "● upstream") or ""
       local vt = { { (" "):rep(width - vim.fn.strdisplaywidth(o.name) + 2) },
-        { o.head and "● " or "  ", "GitBranchHead" }, { ("%-4s "):format(o.age), "GitSubtleText" } }
+        { tag, "GitBranchHead" }, { (" "):rep(12 - vim.fn.strdisplaywidth(tag)) }, { ("%-4s "):format(o.age), "GitSubtleText" } }
       if pr then vt[#vt + 1] = { "#" .. str(pr.number, "?") .. " " .. s:lower() .. " ", PR_STATE[s] or "Comment" } end
       vt[#vt + 1] = { o.subject, "GitSubtleText" }
-      vim.api.nvim_buf_set_extmark(buf, bns, i - 1, 0, { invalidate = true, undo_restore = false, virt_text = vt })
+      local p = edit and #("/" .. o.id .. " ") or 0
+      vim.api.nvim_buf_set_extmark(buf, bns, i - 1, 0, { invalidate = true, undo_restore = false, virt_text = vt,
+        end_col = o.current and p + #o.name or nil, hl_group = o.current and "GitBranchHead" or nil })
     end
   end
 
+  local first
   local function load()
     git({ "for-each-ref", "--sort=-committerdate", edit and "refs/heads" or "refs/remotes",
       "--format=%(refname:short)%09%(objectname)%09%(HEAD)%09%(committerdate:unix)%09%(upstream:short)%09"
@@ -2498,6 +2503,8 @@ local function branches(kind)
             up_remote = f[6], up_ref = f[7], gone = f[8] == "[gone]", subject = table.concat(f, "\t", 9) }
           -- a PR's head is the branch on the remote: the upstream's name when there is one
           o.pr_key = edit and (up and f[7]:gsub("^refs/heads/", "") or name) or short
+          -- current: the checked-out branch, or in the remote list its upstream
+          o.current = edit and o.head or (not edit and S.data and S.data.st.upstream == name)
           orig[#orig + 1] = o
           L[#L + 1] = edit and ("/" .. o.id .. " " .. name) or name
         end
@@ -2508,6 +2515,10 @@ local function branches(kind)
       vim.bo[buf].modifiable, vim.bo[buf].modified = edit, false
       decorate(S.branch_prs and S.branch_prs.root == S.root and S.branch_prs.map)
       branch_prs(function(prs) if vim.api.nvim_buf_is_valid(buf) then decorate(prs) end end)
+      if not first and cur then -- first load: start on the current branch
+        for i, o in ipairs(orig) do if o.current then cur = { i, 0 } end end
+      end
+      first = true
       if cur then pcall(vim.api.nvim_win_set_cursor, 0, cur) end
     end)
   end
