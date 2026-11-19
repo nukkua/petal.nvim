@@ -183,19 +183,25 @@ empty is dropped. Author, date and message are kept. Only changes to
 existing text files move, and only in linear unpushed history.
 
                                                            *petal-branches*
-Local branches (`b l`): one branch per line in a buffer you edit like text
-(oil-style), then `:w` applies the changes:
-  `dd`        delete (an unmerged branch asks to force)
+`b l` (local) and `b R` (remote) open the branches as a list at the bottom,
+newest first, each with its age, last subject and PR badge (`#12 open`, from
+one `gh pr list`, rechecked like the PR line and after a manual fetch).
+<CR> switches to the branch under the cursor and closes the list; on a
+remote branch it creates the local tracking branch. `q` closes.
+
+The local list is a buffer you edit like text (oil-style); `:w` applies:
+  `dd`        delete (an unmerged branch asks to force); then, if it has an
+            upstream, asks to delete that on the remote too. Never offered
+            for the remote's default branch, |petal-opt-base_branches|, or
+            an upstream another branch still tracks
   `yy` `p`    copy: the pasted line, renamed, becomes a branch at that commit
   `cw` `cc`   rename (`branch -m`, keeps upstream and reflog)
   `o`         a new line creates a branch at HEAD
-  <CR>        switch to the branch under the cursor
-  `q`         close (asks first if there are unsaved edits)
 Every save lists what it will do and asks first. Refused: deleting the
 checked-out branch, a name listed twice, a name that already exists (swap
 names in two saves), `<remote>/…` names, and invalid names. The first failing
-step stops the rest; the list then reloads to show what was done.
-Remote branches (`b R`): a picker, <CR> checks out the tracking branch.
+step stops the rest; the list then reloads to show what was done. <CR> and
+`q` ask you to save or undo first.
 
 Log views get the popup keys (`$` to `Z` above) plus goto and help; commit and
 diff views also get the fold keys.

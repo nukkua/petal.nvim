@@ -2409,53 +2409,105 @@ local function branch_op(op, raw)
       if not confirm(o.name .. " is not fully merged. Force delete?") then return true end
       r = raw({ "branch", "-D", o.name })
     end
+    -- its upstream too, if asked: never the remote's default or a base branch, nor one still tracked
+    local up = o.upstream
+    if r.code == 0 and up and o.up_remote ~= "." and not o.gone and not op.shared then
+      local def = vim.trim(raw({ "symbolic-ref", "-q", "--short", "refs/remotes/" .. o.up_remote .. "/HEAD" }).stdout or "")
+      local b = o.up_ref:gsub("^refs/heads/", "")
+      if up ~= def and not vim.tbl_contains(C.base_branches, up) and confirm("Also delete " .. b .. " on " .. o.up_remote .. "? (can't be undone)") then
+        local p = raw({ "push", o.up_remote, "--delete", b })
+        if p.code ~= 0 then fail("delete " .. up, p) end -- the local delete is done: carry on
+      end
+    end
   elseif op.op == "rename" then r = raw({ "branch", "-m", o.name, op.to }) -- -m keeps reflog and upstream
   else r = raw({ "branch", op.to, o and o.sha or "HEAD" }) end -- copies use the sha loaded: order-proof
   if r.code ~= 0 then fail(plan_line(op), r) end
   return r.code == 0
 end
 
-local function branches()
-  local set = S.data and S.data.remoteset or {}
+-- PR per head branch name from one `gh pr list` (newest first), cached PR_TTL like the PR line
+local function branch_prs(cb)
+  if C.simple or not HAS_GH or not (S.data and #S.data.remotes > 0) then return end
+  local c = S.branch_prs
+  if c and c.root == S.root and vim.uv.now() - c.at < PR_TTL then return cb(c.map) end
+  S.branch_prs = { root = S.root, at = vim.uv.now(), map = c and c.map or {} } -- one gh call in flight
+  gh({ "pr", "list", "--state", "all", "--limit", "200", "--json", "number,state,isDraft,headRefName" }, {}, function(r)
+    local map = {}
+    for _, pr in ipairs(json(r) or {}) do
+      local h = str(pr.headRefName)
+      map[h] = map[h] or pr
+    end
+    S.branch_prs = { root = S.root, at = vim.uv.now(), map = map }
+    cb(map)
+  end)
+end
+
+-- bottom list of branches, same look for both kinds. "local": oil-style, each line "/<id> <name>"
+-- (the concealed id says which branch it came from; :w applies). "remote": read-only, <CR> checks out
+local function branches(kind)
+  local set, edit = S.data and S.data.remoteset or {}, kind == "local"
   local buf, orig = S.branch_buf, {}
   if buf and vim.api.nvim_buf_is_valid(buf) then
     local win = vim.fn.bufwinid(buf)
-    if win ~= -1 then return vim.api.nvim_set_current_win(win) end
-    pcall(vim.api.nvim_buf_delete, buf, { force = true }) -- hidden by :close etc: start over
+    if win ~= -1 and vim.b[buf].petal_kind == kind then return vim.api.nvim_set_current_win(win) end
+    if vim.bo[buf].modified and not confirm("Discard branch edits?") then return end
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
   end
   local src = vim.api.nvim_get_current_win()
   buf = vim.api.nvim_create_buf(false, true)
-  S.branch_buf = buf
-  vim.bo[buf].buftype, vim.bo[buf].bufhidden, vim.bo[buf].filetype = "acwrite", "hide", "petalbranches"
-  pcall(vim.api.nvim_buf_set_name, buf, "git://branches")
-  -- bottom split, like the popups and pickers
+  S.branch_buf, vim.b[buf].petal_kind = buf, kind
+  vim.bo[buf].buftype, vim.bo[buf].bufhidden, vim.bo[buf].filetype = edit and "acwrite" or "nofile", "hide", "petalbranches"
+  pcall(vim.api.nvim_buf_set_name, buf, "git://branches/" .. kind)
   local win = vim.api.nvim_open_win(buf, true, { split = "below", win = -1, height = C.height })
   local w = vim.wo[win][0]
   w.number, w.conceallevel, w.concealcursor, w.winfixheight = true, 3, "nvic", true
+  w.statusline = edit and " Local branches  %m  (:w applies)" or " Remote branches  (<CR> checks out)"
   vim.cmd([[syntax match PetalBranchId /^\/\d\+ / conceal]])
   local bns = vim.api.nvim_create_namespace("petal.branches")
 
+  local function decorate(prs)
+    vim.api.nvim_buf_clear_namespace(buf, bns, 0, -1)
+    local width = 0
+    for _, o in ipairs(orig) do width = math.max(width, vim.fn.strdisplaywidth(o.name)) end
+    for i, o in ipairs(orig) do
+      local pr = prs and prs[o.pr_key]
+      local s = pr and pr_state(pr)
+      local vt = { { (" "):rep(width - vim.fn.strdisplaywidth(o.name) + 2) },
+        { o.head and "● " or "  ", "GitBranchHead" }, { ("%-4s "):format(o.age), "GitSubtleText" } }
+      if pr then vt[#vt + 1] = { "#" .. str(pr.number, "?") .. " " .. s:lower() .. " ", PR_STATE[s] or "Comment" } end
+      vt[#vt + 1] = { o.subject, "GitSubtleText" }
+      vim.api.nvim_buf_set_extmark(buf, bns, i - 1, 0, { invalidate = true, undo_restore = false, virt_text = vt })
+    end
+  end
+
   local function load()
-    git({ "for-each-ref", "--sort=-committerdate", "refs/heads",
-      "--format=%(refname:short)%09%(objectname)%09%(HEAD)%09%(committerdate:unix)%09%(contents:subject)" }, nil, function(r)
+    git({ "for-each-ref", "--sort=-committerdate", edit and "refs/heads" or "refs/remotes",
+      "--format=%(refname:short)%09%(objectname)%09%(HEAD)%09%(committerdate:unix)%09%(upstream:short)%09"
+        .. "%(upstream:remotename)%09%(upstream:remoteref)%09%(upstream:track)%09%(contents:subject)" }, nil, function(r)
       if not vim.api.nvim_buf_is_valid(buf) then return end
       orig = {}
       local L = {}
       for _, l in ipairs(lines(r.stdout)) do
-        local name, sha, head, t, subj = l:match("^(.-)\t(.-)\t(.-)\t(.-)\t(.*)$")
-        if name then
-          orig[#orig + 1] = { id = #orig + 1, name = name, sha = sha, head = head == "*", age = age(t), subject = subj }
-          L[#L + 1] = "/" .. #orig .. " " .. name
+        local f = vim.split(l, "\t", { plain = true })
+        local name = f[1]
+        local rem, short = name:match("^([^/]+)/(.+)$")
+        -- remote list: only configured remotes, never <remote>/HEAD
+        if #f >= 9 and (edit or (rem and set[rem] and short ~= "HEAD")) then
+          local up = f[5] ~= "" and f[5] or nil
+          local o = { id = #orig + 1, name = name, sha = f[2], head = f[3] == "*", age = age(f[4]), upstream = up,
+            up_remote = f[6], up_ref = f[7], gone = f[8] == "[gone]", subject = table.concat(f, "\t", 9) }
+          -- a PR's head is the branch on the remote: the upstream's name when there is one
+          o.pr_key = edit and (up and f[7]:gsub("^refs/heads/", "") or name) or short
+          orig[#orig + 1] = o
+          L[#L + 1] = edit and ("/" .. o.id .. " " .. name) or name
         end
       end
       local cur = vim.api.nvim_win_get_buf(0) == buf and vim.api.nvim_win_get_cursor(0)
+      vim.bo[buf].modifiable = true
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, L)
-      vim.api.nvim_buf_clear_namespace(buf, bns, 0, -1)
-      for i, o in ipairs(orig) do
-        vim.api.nvim_buf_set_extmark(buf, bns, i - 1, 0, { invalidate = true, undo_restore = false,
-          virt_text = { { (o.head and "● " or "") .. o.age .. "  " .. o.subject, o.head and "GitBranchHead" or "GitSubtleText" } } })
-      end
-      vim.bo[buf].modified = false
+      vim.bo[buf].modifiable, vim.bo[buf].modified = edit, false
+      decorate(S.branch_prs and S.branch_prs.root == S.root and S.branch_prs.map)
+      branch_prs(function(prs) if vim.api.nvim_buf_is_valid(buf) then decorate(prs) end end)
       if cur then pcall(vim.api.nvim_win_set_cursor, 0, cur) end
     end)
   end
@@ -2464,6 +2516,11 @@ local function branches()
     local plan, why = branch_plan(orig, vim.api.nvim_buf_get_lines(buf, 0, -1, false), set)
     if not plan then return notify("branches: " .. why, vim.log.levels.WARN) end
     if #plan == 0 then vim.bo[buf].modified = false; return end
+    -- an upstream another kept branch still tracks is never offered for deletion
+    local gone, used = {}, {}
+    for _, op in ipairs(plan) do if op.op == "delete" then gone[op.src.id] = true end end
+    for _, o in ipairs(orig) do if not gone[o.id] and o.upstream then used[o.upstream] = true end end
+    for _, op in ipairs(plan) do if op.op == "delete" then op.shared = used[op.src.upstream] end end
     job("branches", "", function(_, raw) -- no temp file: os.remove("") is a no-op
       local text = {}
       for _, op in ipairs(plan) do
@@ -2479,35 +2536,40 @@ local function branches()
     end)
   end
 
-  local o = { buffer = buf, nowait = true }
-  vim.api.nvim_create_autocmd("BufWriteCmd", { buffer = buf, callback = save })
-  -- keep the cursor off the hidden id, so cw/I/0 edit the name only
-  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, { buffer = buf, callback = function()
-    local row, col = unpack(vim.api.nvim_win_get_cursor(0))
-    local p = #(vim.api.nvim_get_current_line():match("^/%d+ ") or "")
-    if col < p then vim.api.nvim_win_set_cursor(0, { row, p }) end
-  end })
-  for _, k in ipairs({ "cc", "S" }) do -- change the name, keep the id: cc is the natural rename
-    vim.keymap.set("n", k, function()
-      vim.api.nvim_win_set_cursor(0, { vim.fn.line("."), #(vim.api.nvim_get_current_line():match("^/%d+ ") or "") })
-      vim.api.nvim_feedkeys("C", "n", false)
-    end, o)
-  end
-  vim.keymap.set("n", "q", function()
-    if vim.bo[buf].modified and not confirm("Discard branch edits?") then return end
+  local function close()
     S.branch_buf = nil
     pcall(vim.api.nvim_buf_delete, buf, { force = true }) -- closes the split too
     if vim.api.nvim_win_is_valid(src) then vim.api.nvim_set_current_win(src) end
+  end
+  local o = { buffer = buf, nowait = true }
+  vim.keymap.set("n", "q", function()
+    if vim.bo[buf].modified and not confirm("Discard branch edits?") then return end
+    close()
   end, o)
   vim.keymap.set("n", "<CR>", function()
-    local n = vim.trim((vim.api.nvim_get_current_line():gsub("^/%d+ ", "")))
+    local row = vim.fn.line(".")
     if vim.bo[buf].modified then return notify("branches: save (:w) or undo first", vim.log.levels.WARN) end
-    if n == "" then return end
-    act({ "switch", n })
-    S.branch_buf = nil
-    pcall(vim.api.nvim_buf_delete, buf, { force = true }) -- like the picker: <CR> picks and closes
-    if vim.api.nvim_win_is_valid(src) then vim.api.nvim_set_current_win(src) end
+    local b = orig[row]
+    if not b then return end
+    -- remote: switch to (or DWIM-create) the local tracking branch
+    act({ "switch", edit and b.name or (b.name:gsub("^[^/]+/", "")) })
+    close()
   end, o)
+  if edit then
+    vim.api.nvim_create_autocmd("BufWriteCmd", { buffer = buf, callback = save })
+    -- keep the cursor off the hidden id, so cw/I/0 edit the name only
+    vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, { buffer = buf, callback = function()
+      local r, col = unpack(vim.api.nvim_win_get_cursor(0))
+      local p = #(vim.api.nvim_get_current_line():match("^/%d+ ") or "")
+      if col < p then vim.api.nvim_win_set_cursor(0, { r, p }) end
+    end })
+    for _, k in ipairs({ "cc", "S" }) do -- change the name, keep the id: cc is the natural rename
+      vim.keymap.set("n", k, function()
+        vim.api.nvim_win_set_cursor(0, { vim.fn.line("."), #(vim.api.nvim_get_current_line():match("^/%d+ ") or "") })
+        vim.api.nvim_feedkeys("C", "n", false)
+      end, o)
+    end
+  end
   load()
 end
 
@@ -2525,13 +2587,8 @@ function P.branch()
         end)
       end },
       { "r", "Recent (previous branch)", function() act({ "switch", "-" }) end },
-      { "l", "Local branches (edit)", branches },
-      { "R", "Remote branch", function()
-        refs({ "refs/remotes" }, function(l)
-          -- switch to (or DWIM-create) the local tracking branch
-          pick("Checkout remote", l, function(b) act({ "switch", (b:gsub("^[^/]+/", "")) }) end)
-        end)
-      end },
+      { "l", "Local branches (edit)", function() branches("local") end },
+      { "R", "Remote branches", function() branches("remote") end },
       { "c", "New branch", function(_, ctx) input("New branch: ", nil, function(n) act(cat({ "switch", "-c", n }, at(ctx))) end) end },
     } },
     { "Create", {
@@ -2599,7 +2656,7 @@ end
 function P.fetch()
   local up = S.data and S.data.st.upstream and S.data.st.upstream:match("^[^/]+")
   -- manual fetch: always recheck the PR (refresh skips gh for PR_TTL otherwise)
-  local fetched = { msg = "Fetching", show = true, after = function() S.pr_at = {} end }
+  local fetched = { msg = "Fetching", show = true, after = function() S.pr_at, S.branch_prs = {}, nil end }
   popup({ title = "Fetch",
     args = { { "p", "--prune", "Prune deleted branches" }, { "t", "--tags", "Fetch all tags" } },
     groups = { { "Fetch from", {

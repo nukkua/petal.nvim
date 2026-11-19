@@ -764,7 +764,7 @@ test("branches buffer: :w deletes, renames, copies, creates; unmerged delete ask
   assert(vim.wait(3000, function() return t.S.data end, 10), "status never rendered")
   local real, asked = vim.fn.confirm, {}
   vim.fn.confirm = function(msg) asked[#asked + 1] = msg; return msg:find("not fully merged") and 2 or 1 end
-  t.branches()
+  t.branches("local")
   local buf = vim.api.nvim_get_current_buf()
   assert(vim.wait(3000, function() return vim.api.nvim_buf_line_count(buf) == 4 end, 10), "branch list never loaded")
   local id = {}
@@ -782,6 +782,55 @@ test("branches buffer: :w deletes, renames, copies, creates; unmerged delete ask
   vim.cmd("normal q")
   vim.cmd.cd(cwd)
   vim.fn.delete(rdir, "rf")
+end)
+
+test("branches: deleting asks to delete the upstream, never the default or a shared one; remote list", function()
+  local rdir, g = repo()
+  local bare = vim.fn.tempname()
+  vim.system({ "git", "init", "-q", "--bare", "-b", "main", bare }):wait()
+  vim.fn.writefile({ "x" }, rdir .. "/x.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "x" })
+  g({ "remote", "add", "origin", bare })
+  for _, b in ipairs({ "main", "feat", "twin" }) do
+    if b ~= "main" then g({ "branch", b }) end
+    g({ "push", "-q", "-u", "origin", b })
+  end
+  g({ "remote", "set-head", "origin", "main" })
+  g({ "branch", "--track", "rel", "origin/main" }); g({ "branch", "--track", "twin2", "origin/twin" })
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  petal.open()
+  assert(vim.wait(3000, function() return t.S.data and t.S.data.remoteset.origin end, 10), "status never rendered")
+  local real, asked = vim.fn.confirm, {}
+  vim.fn.confirm = function(msg) asked[#asked + 1] = msg; return 1 end
+  t.branches("local")
+  local buf = vim.api.nvim_get_current_buf()
+  assert(vim.wait(3000, function() return vim.api.nvim_buf_line_count(buf) == 5 end, 10), "branch list never loaded")
+  local keep = {}
+  for _, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+    if l:match(" main$") or l:match(" twin2$") then keep[#keep + 1] = l end
+  end
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, keep) -- deletes feat, rel (tracks origin/main), twin (twin2 shares it)
+  vim.cmd("write")
+  assert(vim.wait(5000, function() return not vim.bo[buf].modified and vim.api.nvim_buf_line_count(buf) == 2 end, 20), "save never finished")
+  vim.fn.confirm = real
+  local function has(p) for _, m in ipairs(asked) do if m:find(p, 1, true) then return true end end end
+  assert(has("Also delete feat on origin?"), "no upstream prompt: " .. vim.inspect(asked))
+  assert(not has("delete main on origin") and not has("delete twin on origin"), "offered a protected upstream: " .. vim.inspect(asked))
+  local rem = vim.split(vim.trim(vim.system({ "git", "for-each-ref", "--format=%(refname:short)" }, { cwd = bare, text = true }):wait().stdout), "\n")
+  table.sort(rem)
+  eq(rem, { "main", "twin" })
+  vim.cmd("normal q")
+  t.branches("remote")
+  buf = vim.api.nvim_get_current_buf()
+  assert(vim.wait(3000, function() return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] ~= "" end, 10), "remote list never loaded")
+  local L = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  table.sort(L)
+  eq(L, { "origin/main", "origin/twin" }) -- no origin/HEAD, no ids
+  eq(vim.bo[buf].modifiable, false)
+  vim.cmd("normal q")
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf"); vim.fn.delete(bare, "rf")
 end)
 
 vim.fn.delete(dir, "rf")
