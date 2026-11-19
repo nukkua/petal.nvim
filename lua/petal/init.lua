@@ -2351,6 +2351,198 @@ function P.commit()
     } })
 end
 
+-- branch buffer (oil-style): each line is "/<id> <name>", the concealed id says which ref it came
+-- from, so dd deletes, yy+p copies, editing the name renames, a new line creates at HEAD; :w applies
+local function ref_of(name, set)
+  local r, b = name:match("^([^/]+)/(.+)$")
+  if r and set[r] then return { name = name, remote = r, short = b } end
+  return { name = name, short = name }
+end
+
+-- pure: buffer lines vs the refs they were loaded from -> ops (deletes, renames, creates, then the
+-- deletes of moves across local/remote), or nil + why. Freed names are reusable only from a delete
+local function branch_plan(orig, buf_lines, set)
+  local kept, news, seen = {}, {}, {}
+  for _, o in ipairs(orig) do kept[o.id] = {} end
+  for i, l in ipairs(buf_lines) do
+    local id, name = l:match("^/(%d+) (.*)$")
+    if not id and l:match("^/%d") then return nil, "line " .. i .. ": its hidden id was edited, undo with u" end
+    name = vim.trim(name or l)
+    if name ~= "" then
+      if seen[name] then return nil, name .. " is listed twice" end
+      seen[name] = true
+      if not id then news[#news + 1] = name
+      elseif kept[tonumber(id)] then table.insert(kept[tonumber(id)], name)
+      else return nil, "line " .. i .. ": unknown id /" .. id end
+    end
+  end
+  local byname, dels, renames, creates, after = {}, {}, {}, {}, {}
+  for _, o in ipairs(orig) do byname[o.name] = o end
+  for _, o in ipairs(orig) do
+    local stays, copies = false, {}
+    for _, n in ipairs(kept[o.id]) do
+      if n == o.name then stays = true else copies[#copies + 1] = n end
+    end
+    if not stays then
+      if o.head and not (copies[1] and not ref_of(copies[1], set).remote) then
+        return nil, "can't delete " .. o.name .. ": it is checked out"
+      end
+      if #copies == 0 then dels[#dels + 1] = { op = "delete", ref = o }
+      else
+        local to = ref_of(table.remove(copies, 1), set)
+        if to.remote == o.remote then renames[#renames + 1] = { op = "rename", src = o, to = to }
+        else
+          creates[#creates + 1] = { op = "create", src = o, to = to }
+          after[#after + 1] = { op = "delete", ref = o }
+        end
+      end
+    end
+    for _, n in ipairs(copies) do
+      creates[#creates + 1] = { op = "create", src = o, to = ref_of(n, set), track = stays and o.remote ~= nil }
+    end
+  end
+  for _, n in ipairs(news) do creates[#creates + 1] = { op = "create", to = ref_of(n, set) } end
+  local freed = {}
+  for _, d in ipairs(dels) do freed[d.ref.name] = true end
+  for _, op in ipairs(cat(renames, creates)) do
+    if byname[op.to.name] and not freed[op.to.name] then
+      return nil, op.to.name .. " already exists (swap names in two saves)"
+    end
+  end
+  return cat(dels, renames, creates, after)
+end
+
+local function plan_line(op)
+  local where = function(r) return r.name .. (r.remote and " (remote)" or "") end
+  if op.op == "delete" then return "delete  " .. where(op.ref) end
+  if op.op == "rename" then return "rename  " .. op.src.name .. " → " .. where(op.to) end
+  return "create  " .. where(op.to) .. " from " .. (op.src and op.src.name or "HEAD")
+end
+
+-- one op; false stops the rest. Declining a force delete skips that branch only
+local function branch_op(op, raw)
+  local o, t, r = op.ref or op.src, op.to, nil
+  if op.op == "delete" and o.remote then
+    r = raw({ "push", o.remote, "--delete", o.short })
+    -- already gone on the remote: drop the stale tracking ref
+    if r.code ~= 0 and (r.stderr or ""):find("remote ref does not exist") then r = raw({ "branch", "-d", "-r", o.name }) end
+  elseif op.op == "delete" then
+    r = raw({ "branch", "-d", o.name })
+    if r.code ~= 0 and (r.stderr or ""):find("not fully merged") then
+      if not confirm(o.name .. " is not fully merged. Force delete?") then return true end
+      r = raw({ "branch", "-D", o.name })
+    end
+  elseif op.op == "rename" and o.remote then
+    r = raw({ "push", "--atomic", o.remote, o.sha .. ":refs/heads/" .. t.short, ":refs/heads/" .. o.short })
+  elseif op.op == "rename" then
+    r = raw({ "branch", "-m", o.name, t.name }) -- -m keeps reflog and upstream config
+  else
+    local sha = o and o.sha or "HEAD"
+    r = t.remote and raw({ "push", t.remote, sha .. ":refs/heads/" .. t.short }) or raw({ "branch", t.name, sha })
+    if r.code == 0 and op.track and not t.remote then r = raw({ "branch", "-u", o.name, t.name }) end
+  end
+  if r.code ~= 0 then fail(plan_line(op), r) end
+  return r.code == 0
+end
+
+local function branches()
+  local set = S.data and S.data.remoteset or {}
+  local buf, orig = S.branch_buf, {}
+  if buf and vim.api.nvim_buf_is_valid(buf) then return vim.api.nvim_win_set_buf(0, buf) end
+  local prev = vim.api.nvim_get_current_buf()
+  buf = vim.api.nvim_create_buf(false, true)
+  S.branch_buf = buf
+  vim.bo[buf].buftype, vim.bo[buf].bufhidden, vim.bo[buf].filetype = "acwrite", "hide", "petalbranches"
+  pcall(vim.api.nvim_buf_set_name, buf, "git://branches")
+  vim.api.nvim_win_set_buf(0, buf)
+  local w = vim.wo[0][0]
+  w.number, w.conceallevel, w.concealcursor = true, 3, "nvic"
+  vim.cmd([[syntax match PetalBranchId /^\/\d\+ / conceal]])
+  for r in pairs(set) do
+    vim.cmd([[syntax match GitRemote /^\/\d\+ \zs]] .. vim.fn.escape(r, "\\/.*$^~[]") .. [[\/.*/]])
+  end
+  local bns = vim.api.nvim_create_namespace("petal.branches")
+
+  local function load()
+    git({ "for-each-ref", "--sort=-committerdate", "refs/heads", "refs/remotes",
+      "--format=%(refname)%09%(objectname)%09%(HEAD)%09%(committerdate:unix)%09%(contents:subject)" }, nil, function(r)
+      if not vim.api.nvim_buf_is_valid(buf) then return end
+      orig = {}
+      local L = {}
+      for _, l in ipairs(lines(r.stdout)) do
+        local ref, sha, head, t, subj = l:match("^(.-)\t(.-)\t(.-)\t(.-)\t(.*)$")
+        local rname, lname = (ref or ""):match("^refs/remotes/(.+)$"), (ref or ""):match("^refs/heads/(.+)$")
+        local o = ref_of(rname or lname or "", set)
+        -- skipped: remote HEAD, refs of removed remotes, local branches named like a remote ref
+        if (rname and o.remote and o.short ~= "HEAD") or (lname and not o.remote) then
+          o.id, o.sha, o.head, o.age, o.subject = #orig + 1, sha, head == "*", age(t), subj
+          orig[#orig + 1] = o
+          L[#L + 1] = "/" .. o.id .. " " .. o.name
+        end
+      end
+      local cur = vim.api.nvim_win_get_buf(0) == buf and vim.api.nvim_win_get_cursor(0)
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, L)
+      vim.api.nvim_buf_clear_namespace(buf, bns, 0, -1)
+      for i, o in ipairs(orig) do
+        vim.api.nvim_buf_set_extmark(buf, bns, i - 1, 0, { invalidate = true, undo_restore = false,
+          virt_text = { { (o.head and "● " or "") .. o.age .. "  " .. o.subject, o.head and "GitBranchHead" or "GitSubtleText" } } })
+      end
+      vim.bo[buf].modified = false
+      if cur then pcall(vim.api.nvim_win_set_cursor, 0, cur) end
+    end)
+  end
+
+  local function save()
+    local plan, why = branch_plan(orig, vim.api.nvim_buf_get_lines(buf, 0, -1, false), set)
+    if not plan then return notify("branches: " .. why, vim.log.levels.WARN) end
+    if #plan == 0 then vim.bo[buf].modified = false; return end
+    job("branches", "", function(_, raw) -- no temp file: os.remove("") is a no-op
+      local remote, text = false, {}
+      for _, op in ipairs(plan) do
+        local t = op.to
+        if t and raw({ "check-ref-format", "--branch", t.short }).code ~= 0 then
+          return notify("branches: not a valid branch name: " .. t.name, vim.log.levels.WARN)
+        end
+        remote = remote or (op.ref or op.to).remote ~= nil
+        text[#text + 1] = plan_line(op)
+      end
+      if remote then text[#text + 1] = "\nRemote changes affect everyone and can't be undone here." end
+      if not confirm(table.concat(text, "\n")) then return end
+      for _, op in ipairs(plan) do if not branch_op(op, raw) then break end end
+      load()
+      M.refresh()
+    end)
+  end
+
+  local o = { buffer = buf, nowait = true }
+  vim.api.nvim_create_autocmd("BufWriteCmd", { buffer = buf, callback = save })
+  -- keep the cursor off the hidden id, so cw/I/0 edit the name only
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, { buffer = buf, callback = function()
+    local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+    local p = #(vim.api.nvim_get_current_line():match("^/%d+ ") or "")
+    if col < p then vim.api.nvim_win_set_cursor(0, { row, p }) end
+  end })
+  for _, k in ipairs({ "cc", "S" }) do -- change the name, keep the id: cc is the natural rename
+    vim.keymap.set("n", k, function()
+      vim.api.nvim_win_set_cursor(0, { vim.fn.line("."), #(vim.api.nvim_get_current_line():match("^/%d+ ") or "") })
+      vim.api.nvim_feedkeys("C", "n", false)
+    end, o)
+  end
+  vim.keymap.set("n", "q", function()
+    if vim.bo[buf].modified and not confirm("Discard branch edits?") then return end
+    local back = vim.api.nvim_buf_is_valid(prev) and prev or S.buf
+    if back and vim.api.nvim_buf_is_valid(back) then vim.api.nvim_win_set_buf(0, back) end
+    S.branch_buf = nil
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  end, o)
+  vim.keymap.set("n", "<CR>", function()
+    local n = vim.trim((vim.api.nvim_get_current_line():gsub("^/%d+ ", "")))
+    local r = ref_of(n, set)
+    if n ~= "" then act({ "switch", r.remote and r.short or n }) end -- remote: DWIM-create the tracking branch
+  end, o)
+  load()
+end
+
 function P.branch()
   local function at(ctx) return ctx.commit and { ctx.commit } or {} end
   popup({ title = "Branch", groups = {
@@ -2380,16 +2572,7 @@ function P.branch()
       { "u", "Set upstream", function()
         refs({ "refs/remotes" }, function(l) pick("Upstream", l, function(u) act({ "branch", "-u", u }) end) end)
       end },
-      { "D", "Delete", function()
-        refs({ "refs/heads" }, function(l)
-          pick("Delete branch", l, function(b)
-            git({ "branch", "-d", b }, { log = true }, function(r)
-              if r.code == 0 then return M.refresh() end
-              if confirm(b .. " is not fully merged. Force delete?") then act({ "branch", "-D", b }) end
-            end)
-          end)
-        end)
-      end },
+      { "e", "Edit branches", branches },
     } },
   } })
 end
@@ -3106,7 +3289,7 @@ M._t = {
     return t
   end,
   bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, git_batch = git_batch, paint = paint, ns = ns, untracked_diff = untracked_diff, hunk_owner = hunk_owner, parse_conflicts = parse_conflicts,
-  parse_files = parse_files, patch = patch, kind_of = kind_of, ci_summary = ci_summary, failure = failure, cut = cut, refchunks = refchunks, S = S,
+  parse_files = parse_files, patch = patch, branch_plan = branch_plan, branches = branches, kind_of = kind_of, ci_summary = ci_summary, failure = failure, cut = cut, refchunks = refchunks, S = S,
 }
 
 return M

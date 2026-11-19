@@ -182,6 +182,22 @@ does and the message names the commit that would conflict. A commit left
 empty is dropped. Author, date and message are kept. Only changes to
 existing text files move, and only in linear unpushed history.
 
+                                                           *petal-branches*
+Edit branches (`b e`): local and remote branches as lines of a buffer you
+edit like text (oil-style), then `:w` applies the changes:
+  `dd`        delete (remote: `push --delete`; unmerged local asks to force)
+  `yy` `p`    copy: the pasted line, renamed, becomes a branch at that commit
+  `cw` `cc`   rename (local: `branch -m`, keeps upstream and reflog)
+  `o`         a new line creates a branch at HEAD
+  <CR>        switch to the branch under the cursor
+  `q`         close (asks first if there are unsaved edits)
+A name `<remote>/x` is a branch on that remote, so renaming `feat` to
+`origin/feat` pushes it and deletes the local one. Every save lists what it
+will do and asks first. Refused: deleting the checked-out branch, a name
+listed twice, a name that already exists (swap names in two saves), and
+invalid names. The first failing step stops the rest; the list then reloads
+to show what was done. Undo with `u` before saving.
+
 Log views get the popup keys (`$` to `Z` above) plus goto and help; commit and
 diff views also get the fold keys.
 
