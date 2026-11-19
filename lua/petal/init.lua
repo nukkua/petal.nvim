@@ -2418,15 +2418,20 @@ end
 local function branches()
   local set = S.data and S.data.remoteset or {}
   local buf, orig = S.branch_buf, {}
-  if buf and vim.api.nvim_buf_is_valid(buf) then return vim.api.nvim_win_set_buf(0, buf) end
-  local prev = vim.api.nvim_get_current_buf()
+  if buf and vim.api.nvim_buf_is_valid(buf) then
+    local win = vim.fn.bufwinid(buf)
+    if win ~= -1 then return vim.api.nvim_set_current_win(win) end
+    pcall(vim.api.nvim_buf_delete, buf, { force = true }) -- hidden by :close etc: start over
+  end
+  local src = vim.api.nvim_get_current_win()
   buf = vim.api.nvim_create_buf(false, true)
   S.branch_buf = buf
   vim.bo[buf].buftype, vim.bo[buf].bufhidden, vim.bo[buf].filetype = "acwrite", "hide", "petalbranches"
   pcall(vim.api.nvim_buf_set_name, buf, "git://branches")
-  vim.api.nvim_win_set_buf(0, buf)
-  local w = vim.wo[0][0]
-  w.number, w.conceallevel, w.concealcursor = true, 3, "nvic"
+  -- bottom split, like the popups and pickers
+  local win = vim.api.nvim_open_win(buf, true, { split = "below", win = -1, height = C.height })
+  local w = vim.wo[win][0]
+  w.number, w.conceallevel, w.concealcursor, w.winfixheight = true, 3, "nvic", true
   vim.cmd([[syntax match PetalBranchId /^\/\d\+ / conceal]])
   local bns = vim.api.nvim_create_namespace("petal.branches")
 
@@ -2490,15 +2495,18 @@ local function branches()
   end
   vim.keymap.set("n", "q", function()
     if vim.bo[buf].modified and not confirm("Discard branch edits?") then return end
-    local back = vim.api.nvim_buf_is_valid(prev) and prev or S.buf
-    if back and vim.api.nvim_buf_is_valid(back) then vim.api.nvim_win_set_buf(0, back) end
     S.branch_buf = nil
-    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    pcall(vim.api.nvim_buf_delete, buf, { force = true }) -- closes the split too
+    if vim.api.nvim_win_is_valid(src) then vim.api.nvim_set_current_win(src) end
   end, o)
   vim.keymap.set("n", "<CR>", function()
     local n = vim.trim((vim.api.nvim_get_current_line():gsub("^/%d+ ", "")))
     if vim.bo[buf].modified then return notify("branches: save (:w) or undo first", vim.log.levels.WARN) end
-    if n ~= "" then act({ "switch", n }) end
+    if n == "" then return end
+    act({ "switch", n })
+    S.branch_buf = nil
+    pcall(vim.api.nvim_buf_delete, buf, { force = true }) -- like the picker: <CR> picks and closes
+    if vim.api.nvim_win_is_valid(src) then vim.api.nvim_set_current_win(src) end
   end, o)
   load()
 end
