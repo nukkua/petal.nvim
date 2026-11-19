@@ -437,6 +437,12 @@ test("untracked_diff: same result as git diff --no-index", function()
   for _, p in ipairs({ "text", "nonl", "one", "bin", "empty", "crlf", "blank", "a b", "é", "d/q", "exe", "link" }) do
     eq(t.untracked_diff({ section = "untracked", path = p }), via_git(p), p)
   end
+  -- unchanged on disk: the same object back (no re-read); rewritten: read again
+  local f1 = { section = "untracked", path = "one" }
+  local d1 = t.untracked_diff(f1)
+  assert(t.untracked_diff(f1, nil, d1) == d1, "unchanged file was re-read")
+  put("one", "y\n")
+  eq(t.untracked_diff(f1, nil, d1).hunks[1].lines, { "+y" }, "rewritten file kept the old diff")
   eq(t.untracked_diff({ section = "untracked", path = "d/" }), { header = {}, hunks = {} }, "dir")
   eq(t.untracked_diff({ section = "untracked", path = 'q"uote' }), nil, "path git would quote -> git")
   put(".gitattributes", "*.txt diff=x\n")
@@ -757,6 +763,8 @@ test("branches buffer: :w deletes, renames, copies, creates; one dialog flags un
   vim.fn.writefile({ "x" }, rdir .. "/x.txt")
   g({ "add", "." }); g({ "commit", "-qm", "x" })
   for _, b in ipairs({ "gone", "feat" }) do g({ "branch", b }) end
+  -- an upstream that no longer exists: merged-ness falls back to HEAD, like git branch -d
+  g({ "config", "branch.gone.remote", "." }); g({ "config", "branch.gone.merge", "refs/heads/deleted" })
   g({ "checkout", "-q", "-b", "unmerged" }); vim.fn.writefile({ "y" }, rdir .. "/x.txt"); g({ "commit", "-qam", "y" }); g({ "checkout", "-q", "main" })
   local cwd = vim.fn.getcwd()
   vim.cmd.cd(rdir)

@@ -507,19 +507,13 @@ end
 -- Same parsed result as git's (binary = a NUL in the first 8000 bytes, as git checks), minus the
 -- index line (blob hashes; git apply doesn't need it). nil = let git do it: attributes in play,
 -- a path git would quote, or not a regular file/symlink
-local function untracked_diff(f, cache)
-  local empty = { header = {}, hunks = {} }
-  if f.path:sub(-1) == "/" then return empty end -- git errors on a directory: nothing to show either way
-  if not batchable(f) or attrs_may_apply(f.path, cache) then return nil end
-  local full = S.root .. "/" .. f.path
-  local st = vim.uv.fs_lstat(full)
-  if not st then return empty end -- gone since status ran
+local function untracked_read(f, full, st)
   local data, mode
   if st.type == "link" then
     data, mode = vim.uv.fs_readlink(full), "120000"
   elseif st.type == "file" then
     local h = io.open(full, "rb")
-    if not h then return empty end
+    if not h then return { header = {}, hunks = {} } end
     data, mode = h:read("*a"), bit.band(st.mode, 64) ~= 0 and "100755" or "100644"
     h:close()
   end
@@ -539,6 +533,22 @@ local function untracked_diff(f, cache)
   if not nl then ls[#ls + 1] = "\\ No newline at end of file" end
   local n = #ls - (nl and 0 or 1)
   return { header = header, hunks = { { header = n == 1 and "@@ -0,0 +1 @@" or ("@@ -0,0 +1," .. n .. " @@"), lines = ls, new = 1 } } }
+end
+
+local STAMP = setmetatable({}, { __mode = "k" }) -- diff -> the stat it was read at; weak: dies with the diff
+local function untracked_diff(f, cache, old)
+  local empty = { header = {}, hunks = {} }
+  if f.path:sub(-1) == "/" then return empty end -- git errors on a directory: nothing to show either way
+  if not batchable(f) or attrs_may_apply(f.path, cache) then return nil end
+  local full = S.root .. "/" .. f.path
+  local st = vim.uv.fs_lstat(full)
+  if not st then return empty end -- gone since status ran
+  -- unchanged on disk: the last result stands, no read/split/compare of the whole file every refresh
+  local stamp = st.size .. ":" .. st.mtime.sec .. ":" .. st.mtime.nsec .. ":" .. st.ino .. ":" .. st.mode
+  if old and STAMP[old] == stamp then return old end
+  local d = untracked_read(f, full, st)
+  if d then STAMP[d] = stamp end
+  return d
 end
 
 local function fkey(f) return f.section .. ":" .. f.path end
@@ -1213,6 +1223,20 @@ end
 
 ---------------------------------------------------------------- refresh
 
+-- --graph (Recent, log views) forces a topo walk of ALL history unless a commit-graph exists:
+-- 200k commits, 670ms vs 5ms on every refresh. Fresh clones have none until gc runs.
+-- Objects live in the common dir: a linked worktree's gitdir points there through its commondir file
+local function has_commit_graph()
+  local common, h = S.gitdir, io.open(S.gitdir .. "/commondir")
+  if h then
+    local c = vim.trim(h:read("*a"))
+    h:close()
+    common = c:sub(1, 1) == "/" and c or (S.gitdir .. "/" .. c)
+  end
+  local info = common .. "/objects/info/"
+  return vim.uv.fs_stat(info .. "commit-graph") ~= nil or vim.uv.fs_stat(info .. "commit-graphs/commit-graph-chain") ~= nil
+end
+
 function M.refresh()
   local buf = S.buf
   if not (S.root and buf and vim.api.nvim_buf_is_valid(buf)) then return end
@@ -1257,11 +1281,11 @@ function M.refresh()
   -- a diff that didn't change keeps its old object, and with it the rows render built for it
   local function keep(k, new)
     local old = S.diffs[k]
-    return old and same_diff(old, new) and old or new
+    return old and (old == new or same_diff(old, new)) and old or new
   end
   local batch, attr_cache = { unstaged = {}, staged = {} }, {}
   for k, f in pairs(S.open) do
-    local native = f.section == "untracked" and untracked_diff(f, attr_cache)
+    local native = f.section == "untracked" and untracked_diff(f, attr_cache, S.diffs[k])
     if f.mode == "U" then
       diffs[k] = { conflicts = parse_conflicts(S.root .. "/" .. f.path) }
     elseif native then
@@ -2413,7 +2437,7 @@ end
 local function branch_prs(cb)
   if C.simple or not HAS_GH or not (S.data and #S.data.remotes > 0) then return end
   local c = S.branch_prs
-  if c and c.root == S.root and vim.uv.now() - c.at < PR_TTL then return cb(c.map) end
+  if c and c.root == S.root and vim.uv.now() - c.at < PR_TTL then return end -- the caller drew the cached map
   S.branch_prs = { root = S.root, at = vim.uv.now(), map = c and c.map or {} } -- one gh call in flight
   gh({ "pr", "list", "--state", "all", "--limit", "200", "--json", "number,state,isDraft,headRefName" }, {}, function(r)
     local map = {}
@@ -2452,14 +2476,14 @@ local function branches(kind)
   local function decorate(prs)
     vim.api.nvim_buf_clear_namespace(buf, bns, 0, -1)
     local width = 0
-    for _, o in ipairs(orig) do width = math.max(width, vim.fn.strdisplaywidth(o.name)) end
+    for _, o in ipairs(orig) do o.w = o.w or vim.api.nvim_strwidth(o.name); width = math.max(width, o.w) end
     for i, o in ipairs(orig) do
       local pr = prs and prs[o.pr_key]
       local s = pr and pr_state(pr)
       -- tag column: blanks carry no highlight (an underlined Head group would draw them as __)
       local tag = o.current and (edit and "● current" or "● upstream") or ""
-      local vt = { { (" "):rep(width - vim.fn.strdisplaywidth(o.name) + 2) },
-        { tag, "GitBranchHead" }, { (" "):rep(12 - vim.fn.strdisplaywidth(tag)) }, { ("%-4s "):format(o.age), "GitSubtleText" } }
+      local vt = { { (" "):rep(width - o.w + 2) },
+        { tag, "GitBranchHead" }, { (" "):rep(12 - vim.api.nvim_strwidth(tag)) }, { ("%-4s "):format(o.age), "GitSubtleText" } }
       if pr then vt[#vt + 1] = { "#" .. str(pr.number, "?") .. " " .. s:lower() .. " ", PR_STATE[s] or "Comment" } end
       vt[#vt + 1] = { o.subject, "GitSubtleText" }
       local p = edit and #("/" .. o.id .. " ") or 0
@@ -2472,7 +2496,7 @@ local function branches(kind)
   local function load()
     git({ "for-each-ref", "--sort=-committerdate", edit and "refs/heads" or "refs/remotes",
       "--format=%(refname:short)%09%(objectname)%09%(HEAD)%09%(committerdate:unix)%09%(upstream:short)%09"
-        .. "%(upstream:remotename)%09%(upstream:remoteref)%09%(upstream:track)%09%(contents:subject)" }, nil, function(r)
+        .. "%(upstream:remotename)%09%(upstream:remoteref)%09%(contents:subject)" }, nil, function(r)
       if not vim.api.nvim_buf_is_valid(buf) then return end
       orig = {}
       local L = {}
@@ -2481,10 +2505,10 @@ local function branches(kind)
         local name = f[1]
         local rem, short = name:match("^([^/]+)/(.+)$")
         -- remote list: only configured remotes, never <remote>/HEAD
-        if #f >= 9 and (edit or (rem and set[rem] and short ~= "HEAD")) then
+        if #f >= 8 and (edit or (rem and set[rem] and short ~= "HEAD")) then
           local up = f[5] ~= "" and f[5] or nil
           local o = { id = #orig + 1, name = name, sha = f[2], head = f[3] == "*", age = age(f[4]), upstream = up,
-            up_remote = f[6], up_ref = f[7], gone = f[8] == "[gone]", subject = table.concat(f, "\t", 9) }
+            up_remote = f[6], up_ref = f[7], subject = table.concat(f, "\t", 8) }
           -- a PR's head is the branch on the remote: the upstream's name when there is one
           o.pr_key = edit and (up and f[7]:gsub("^refs/heads/", "") or name) or short
           -- current: the checked-out branch, or in the remote list its upstream
@@ -2526,9 +2550,13 @@ local function branches(kind)
         local line, o = plan_line(op), op.src
         if op.op == "delete" then
           dels[#dels + 1] = o.name
-          -- git branch -d's rule: merged into the upstream if it has one, else into HEAD
-          local into = o.upstream and not o.gone and o.upstream or "HEAD"
-          if raw({ "merge-base", "--is-ancestor", o.sha, into }).code ~= 0 then line = line .. "  (not merged: its commits will be lost)" end
+          -- git branch -d's rule: merged into the upstream if it has one, else into HEAD.
+          -- no %(upstream:track) in the list for [gone]: it counts ahead/behind per branch, far slower
+          -- than this. A gone upstream is a bad ref: exit 128 (not merged is 1)
+          local m = o.upstream and raw({ "merge-base", "--is-ancestor", o.sha, o.upstream })
+          o.gone = m and m.code == 128
+          if not m or o.gone then m = raw({ "merge-base", "--is-ancestor", o.sha, "HEAD" }) end
+          if m.code ~= 0 then line = line .. "  (not merged: its commits will be lost)" end
           -- its upstream too: never the remote's default or a base branch, nor one still tracked
           local rm = o.up_remote
           if o.upstream and rm ~= "." and not o.gone and not op.shared then
@@ -3150,6 +3178,7 @@ function watch_sync()
     local want = { [gitdir] = true, [gitdir .. "/refs"] = true, [gitdir .. "/refs/heads"] = true, [root] = true }
     local n = 0
     for _, p in ipairs(vim.split(r.stdout, "\0", { plain = true, trimempty = true })) do
+      if n >= WATCH_MAX then break end
       local dir = p:match("^(.*)/$") or p:match("^(.*)/[^/]*$") -- "dir/" is an untracked dir: watch it
       while dir and not want[root .. "/" .. dir] and n < WATCH_MAX do
         want[root .. "/" .. dir], n = true, n + 1
@@ -3174,7 +3203,8 @@ function M.open()
     vim.system({ "git", "init", cwd }):wait()
     root, gitdir = cwd, cwd .. "/.git"
   end
-  if root ~= S.root then
+  local same = root == S.root
+  if not same then
     S.open, S.diffs, S.data, S.fetch.at, S.base, S.radar_cache = {}, {}, nil, -math.huge, nil, {}
     unwatch_all()
   end
@@ -3189,6 +3219,11 @@ function M.open()
     S.attrs = vim.uv.fs_stat(gitdir .. "/info/attributes") ~= nil or vim.uv.fs_stat(af) ~= nil
   end)
   S.pr_at = {} -- opening always rechecks the PR
+  -- git's own cache file (what gc writes): ~1s once in the background, and later commits stay fast
+  if S.graph_root ~= root and not has_commit_graph() then
+    S.graph_root = root
+    git({ "commit-graph", "write", "--reachable", "--no-progress" })
+  end
 
   if not (S.buf and vim.api.nvim_buf_is_valid(S.buf)) then
     S.buf = vim.api.nvim_create_buf(false, true)
@@ -3228,7 +3263,9 @@ function M.open()
   else
     M.refresh()
   end
-  watch_sync()
+  -- reopening the same repo: watchers are live and new dirs arrive as events (watch_dirs), so no
+  -- repo-wide ls-files per open (it walks every untracked dir)
+  if not (same and next(S.watch) and not watch_dirs) then watch_sync() end
   if not C.simple then fetch_bg() end
 end
 
