@@ -2351,16 +2351,10 @@ function P.commit()
     } })
 end
 
--- branch buffer (oil-style): each line is "/<id> <name>", the concealed id says which ref it came
--- from, so dd deletes, yy+p copies, editing the name renames, a new line creates at HEAD; :w applies
-local function ref_of(name, set)
-  local r, b = name:match("^([^/]+)/(.+)$")
-  if r and set[r] then return { name = name, remote = r, short = b } end
-  return { name = name, short = name }
-end
-
--- pure: buffer lines vs the refs they were loaded from -> ops (deletes, renames, creates, then the
--- deletes of moves across local/remote), or nil + why. Freed names are reusable only from a delete
+-- local branch buffer (oil-style): each line is "/<id> <name>", the concealed id says which branch
+-- it came from, so dd deletes, yy+p copies, editing the name renames, a new line creates at HEAD
+-- pure: buffer lines vs the branches they were loaded from -> ops (deletes, renames, creates), or
+-- nil + why. set: remote names, refused as prefixes so origin/x never means two things
 local function branch_plan(orig, buf_lines, set)
   local kept, news, seen = {}, {}, {}
   for _, o in ipairs(orig) do kept[o.id] = {} end
@@ -2376,71 +2370,47 @@ local function branch_plan(orig, buf_lines, set)
       else return nil, "line " .. i .. ": unknown id /" .. id end
     end
   end
-  local byname, dels, renames, creates, after = {}, {}, {}, {}, {}
+  local byname, dels, renames, creates = {}, {}, {}, {}
   for _, o in ipairs(orig) do byname[o.name] = o end
   for _, o in ipairs(orig) do
     local stays, copies = false, {}
     for _, n in ipairs(kept[o.id]) do
       if n == o.name then stays = true else copies[#copies + 1] = n end
     end
-    if not stays then
-      if o.head and not (copies[1] and not ref_of(copies[1], set).remote) then
-        return nil, "can't delete " .. o.name .. ": it is checked out"
-      end
-      if #copies == 0 then dels[#dels + 1] = { op = "delete", ref = o }
-      else
-        local to = ref_of(table.remove(copies, 1), set)
-        if to.remote == o.remote then renames[#renames + 1] = { op = "rename", src = o, to = to }
-        else
-          creates[#creates + 1] = { op = "create", src = o, to = to }
-          after[#after + 1] = { op = "delete", ref = o }
-        end
-      end
-    end
-    for _, n in ipairs(copies) do
-      creates[#creates + 1] = { op = "create", src = o, to = ref_of(n, set), track = stays and o.remote ~= nil }
-    end
+    if not stays and #copies == 0 then
+      if o.head then return nil, "can't delete " .. o.name .. ": it is checked out" end
+      dels[#dels + 1] = { op = "delete", src = o }
+    elseif not stays then renames[#renames + 1] = { op = "rename", src = o, to = table.remove(copies, 1) } end
+    for _, n in ipairs(copies) do creates[#creates + 1] = { op = "create", src = o, to = n } end
   end
-  for _, n in ipairs(news) do creates[#creates + 1] = { op = "create", to = ref_of(n, set) } end
+  for _, n in ipairs(news) do creates[#creates + 1] = { op = "create", to = n } end
   local freed = {}
-  for _, d in ipairs(dels) do freed[d.ref.name] = true end
+  for _, d in ipairs(dels) do freed[d.src.name] = true end
   for _, op in ipairs(cat(renames, creates)) do
-    if byname[op.to.name] and not freed[op.to.name] then
-      return nil, op.to.name .. " already exists (swap names in two saves)"
-    end
+    local r = op.to:match("^([^/]+)/")
+    if r and set[r] then return nil, op.to .. " looks like a remote branch (remote branches: b R)" end
+    if byname[op.to] and not freed[op.to] then return nil, op.to .. " already exists (swap names in two saves)" end
   end
-  return cat(dels, renames, creates, after)
+  return cat(dels, renames, creates)
 end
 
 local function plan_line(op)
-  local where = function(r) return r.name .. (r.remote and " (remote)" or "") end
-  if op.op == "delete" then return "delete  " .. where(op.ref) end
-  if op.op == "rename" then return "rename  " .. op.src.name .. " → " .. where(op.to) end
-  return "create  " .. where(op.to) .. " from " .. (op.src and op.src.name or "HEAD")
+  if op.op == "delete" then return "delete  " .. op.src.name end
+  if op.op == "rename" then return "rename  " .. op.src.name .. " → " .. op.to end
+  return "create  " .. op.to .. " from " .. (op.src and op.src.name or "HEAD")
 end
 
 -- one op; false stops the rest. Declining a force delete skips that branch only
 local function branch_op(op, raw)
-  local o, t, r = op.ref or op.src, op.to, nil
-  if op.op == "delete" and o.remote then
-    r = raw({ "push", o.remote, "--delete", o.short })
-    -- already gone on the remote: drop the stale tracking ref
-    if r.code ~= 0 and (r.stderr or ""):find("remote ref does not exist") then r = raw({ "branch", "-d", "-r", o.name }) end
-  elseif op.op == "delete" then
+  local o, r = op.src, nil
+  if op.op == "delete" then
     r = raw({ "branch", "-d", o.name })
     if r.code ~= 0 and (r.stderr or ""):find("not fully merged") then
       if not confirm(o.name .. " is not fully merged. Force delete?") then return true end
       r = raw({ "branch", "-D", o.name })
     end
-  elseif op.op == "rename" and o.remote then
-    r = raw({ "push", "--atomic", o.remote, o.sha .. ":refs/heads/" .. t.short, ":refs/heads/" .. o.short })
-  elseif op.op == "rename" then
-    r = raw({ "branch", "-m", o.name, t.name }) -- -m keeps reflog and upstream config
-  else
-    local sha = o and o.sha or "HEAD"
-    r = t.remote and raw({ "push", t.remote, sha .. ":refs/heads/" .. t.short }) or raw({ "branch", t.name, sha })
-    if r.code == 0 and op.track and not t.remote then r = raw({ "branch", "-u", o.name, t.name }) end
-  end
+  elseif op.op == "rename" then r = raw({ "branch", "-m", o.name, op.to }) -- -m keeps reflog and upstream
+  else r = raw({ "branch", op.to, o and o.sha or "HEAD" }) end -- copies use the sha loaded: order-proof
   if r.code ~= 0 then fail(plan_line(op), r) end
   return r.code == 0
 end
@@ -2458,26 +2428,19 @@ local function branches()
   local w = vim.wo[0][0]
   w.number, w.conceallevel, w.concealcursor = true, 3, "nvic"
   vim.cmd([[syntax match PetalBranchId /^\/\d\+ / conceal]])
-  for r in pairs(set) do
-    vim.cmd([[syntax match GitRemote /^\/\d\+ \zs]] .. vim.fn.escape(r, "\\/.*$^~[]") .. [[\/.*/]])
-  end
   local bns = vim.api.nvim_create_namespace("petal.branches")
 
   local function load()
-    git({ "for-each-ref", "--sort=-committerdate", "refs/heads", "refs/remotes",
-      "--format=%(refname)%09%(objectname)%09%(HEAD)%09%(committerdate:unix)%09%(contents:subject)" }, nil, function(r)
+    git({ "for-each-ref", "--sort=-committerdate", "refs/heads",
+      "--format=%(refname:short)%09%(objectname)%09%(HEAD)%09%(committerdate:unix)%09%(contents:subject)" }, nil, function(r)
       if not vim.api.nvim_buf_is_valid(buf) then return end
       orig = {}
       local L = {}
       for _, l in ipairs(lines(r.stdout)) do
-        local ref, sha, head, t, subj = l:match("^(.-)\t(.-)\t(.-)\t(.-)\t(.*)$")
-        local rname, lname = (ref or ""):match("^refs/remotes/(.+)$"), (ref or ""):match("^refs/heads/(.+)$")
-        local o = ref_of(rname or lname or "", set)
-        -- skipped: remote HEAD, refs of removed remotes, local branches named like a remote ref
-        if (rname and o.remote and o.short ~= "HEAD") or (lname and not o.remote) then
-          o.id, o.sha, o.head, o.age, o.subject = #orig + 1, sha, head == "*", age(t), subj
-          orig[#orig + 1] = o
-          L[#L + 1] = "/" .. o.id .. " " .. o.name
+        local name, sha, head, t, subj = l:match("^(.-)\t(.-)\t(.-)\t(.-)\t(.*)$")
+        if name then
+          orig[#orig + 1] = { id = #orig + 1, name = name, sha = sha, head = head == "*", age = age(t), subject = subj }
+          L[#L + 1] = "/" .. #orig .. " " .. name
         end
       end
       local cur = vim.api.nvim_win_get_buf(0) == buf and vim.api.nvim_win_get_cursor(0)
@@ -2497,16 +2460,13 @@ local function branches()
     if not plan then return notify("branches: " .. why, vim.log.levels.WARN) end
     if #plan == 0 then vim.bo[buf].modified = false; return end
     job("branches", "", function(_, raw) -- no temp file: os.remove("") is a no-op
-      local remote, text = false, {}
+      local text = {}
       for _, op in ipairs(plan) do
-        local t = op.to
-        if t and raw({ "check-ref-format", "--branch", t.short }).code ~= 0 then
-          return notify("branches: not a valid branch name: " .. t.name, vim.log.levels.WARN)
+        if op.to and raw({ "check-ref-format", "--branch", op.to }).code ~= 0 then
+          return notify("branches: not a valid branch name: " .. op.to, vim.log.levels.WARN)
         end
-        remote = remote or (op.ref or op.to).remote ~= nil
         text[#text + 1] = plan_line(op)
       end
-      if remote then text[#text + 1] = "\nRemote changes affect everyone and can't be undone here." end
       if not confirm(table.concat(text, "\n")) then return end
       for _, op in ipairs(plan) do if not branch_op(op, raw) then break end end
       load()
@@ -2537,8 +2497,8 @@ local function branches()
   end, o)
   vim.keymap.set("n", "<CR>", function()
     local n = vim.trim((vim.api.nvim_get_current_line():gsub("^/%d+ ", "")))
-    local r = ref_of(n, set)
-    if n ~= "" then act({ "switch", r.remote and r.short or n }) end -- remote: DWIM-create the tracking branch
+    if vim.bo[buf].modified then return notify("branches: save (:w) or undo first", vim.log.levels.WARN) end
+    if n ~= "" then act({ "switch", n }) end
   end, o)
   load()
 end
@@ -2557,7 +2517,13 @@ function P.branch()
         end)
       end },
       { "r", "Recent (previous branch)", function() act({ "switch", "-" }) end },
-      { "l", "Local branch", function() refs({ "refs/heads" }, function(l) pick("Checkout", l, function(b) act({ "switch", b }) end) end) end },
+      { "l", "Local branches (edit)", branches },
+      { "R", "Remote branch", function()
+        refs({ "refs/remotes" }, function(l)
+          -- switch to (or DWIM-create) the local tracking branch
+          pick("Checkout remote", l, function(b) act({ "switch", (b:gsub("^[^/]+/", "")) }) end)
+        end)
+      end },
       { "c", "New branch", function(_, ctx) input("New branch: ", nil, function(n) act(cat({ "switch", "-c", n }, at(ctx))) end) end },
     } },
     { "Create", {
@@ -2572,7 +2538,6 @@ function P.branch()
       { "u", "Set upstream", function()
         refs({ "refs/remotes" }, function(l) pick("Upstream", l, function(u) act({ "branch", "-u", u }) end) end)
       end },
-      { "e", "Edit branches", branches },
     } },
   } })
 end

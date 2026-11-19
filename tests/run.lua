@@ -728,73 +728,60 @@ test("d and e open their views once git answers (no blocking calls)", function()
 end)
 
 test("branch_plan: dd deletes, yy+p copies, edit renames, new line creates, edge cases refused", function()
-  local set = { origin = true }
   local orig = {
-    { id = 1, name = "main", short = "main", sha = "a", head = true },
-    { id = 2, name = "feat", short = "feat", sha = "b" },
-    { id = 3, name = "origin/old", remote = "origin", short = "old", sha = "c" },
-    { id = 4, name = "gone", short = "gone", sha = "d" },
+    { id = 1, name = "main", sha = "a", head = true },
+    { id = 2, name = "feat", sha = "b" },
+    { id = 3, name = "gone", sha = "c" },
   }
   local function ops(L)
-    local p, why = t.branch_plan(orig, L, set)
+    local p, why = t.branch_plan(orig, L, { origin = true })
     if not p then return why end
     local out = {}
-    for _, o in ipairs(p) do out[#out + 1] = o.op .. " " .. (o.ref or o.src or { name = "HEAD" }).name .. (o.to and (">" .. o.to.name) or "") end
+    for _, o in ipairs(p) do out[#out + 1] = o.op .. " " .. (o.src and o.src.name or "HEAD") .. (o.to and (">" .. o.to) or "") end
     return out
   end
-  eq(ops({ "/1 main", "/2 feat", "/3 origin/old", "/4 gone" }), {})
-  eq(ops({ "/1 main", "/2 feat2", "/2 feat", "/3 origin/new", "", "new" }),
-    { "delete gone", "rename origin/old>origin/new", "create feat>feat2", "create HEAD>new" })
-  eq(ops({ "/1 trunk", "/3 origin/old", "/2 origin/feat" }),
-    { "delete gone", "rename main>trunk", "create feat>origin/feat", "delete feat" })
-  eq(ops({ "/2 feat", "/3 origin/old", "/4 gone" }), "can't delete main: it is checked out")
-  eq(ops({ "/1 origin/main", "/2 feat", "/3 origin/old", "/4 gone" }), "can't delete main: it is checked out")
-  eq(ops({ "/1 main", "/2 gone", "/3 origin/old", "/4 feat" }), "gone already exists (swap names in two saves)")
-  eq(ops({ "/1 main", "/2 gone", "/3 origin/old" }), { "delete gone", "rename feat>gone" }) -- freed by a delete
+  eq(ops({ "/1 main", "/2 feat", "/3 gone" }), {})
+  eq(ops({ "/1 trunk", "/2 feat2", "/2 feat", "", "new" }),
+    { "delete gone", "rename main>trunk", "create feat>feat2", "create HEAD>new" })
+  eq(ops({ "/2 feat", "/3 gone" }), "can't delete main: it is checked out")
+  eq(ops({ "/1 main", "/2 gone", "/3 feat" }), "gone already exists (swap names in two saves)")
+  eq(ops({ "/1 main", "/2 gone" }), { "delete gone", "rename feat>gone" }) -- freed by a delete
   eq(ops({ "/1 main", "/2 feat", "/2 feat" }), "feat is listed twice")
   eq(ops({ "/1 main", "/2feat" }), "line 2: its hidden id was edited, undo with u")
   eq(ops({ "/9 x" }), "line 1: unknown id /9")
+  eq(ops({ "/1 main", "/2 origin/feat", "/3 gone" }), "origin/feat looks like a remote branch (remote branches: b R)")
 end)
 
-test("branches buffer: :w deletes, renames, copies locally and on the remote", function()
+test("branches buffer: :w deletes, renames, copies, creates; unmerged delete asks", function()
   local rdir, g = repo()
-  local bare = vim.fn.tempname()
-  vim.system({ "git", "init", "-q", "--bare", bare }):wait()
   vim.fn.writefile({ "x" }, rdir .. "/x.txt")
   g({ "add", "." }); g({ "commit", "-qm", "x" })
-  for _, b in ipairs({ "gone", "feat", "shared" }) do g({ "branch", b }) end
+  for _, b in ipairs({ "gone", "feat" }) do g({ "branch", b }) end
   g({ "checkout", "-q", "-b", "unmerged" }); vim.fn.writefile({ "y" }, rdir .. "/x.txt"); g({ "commit", "-qam", "y" }); g({ "checkout", "-q", "main" })
-  g({ "remote", "add", "origin", bare }); g({ "push", "-q", "origin", "shared" }); g({ "fetch", "-q", "origin" })
   local cwd = vim.fn.getcwd()
   vim.cmd.cd(rdir)
   petal.open()
-  assert(vim.wait(3000, function() return t.S.data and t.S.data.remoteset.origin end, 10), "status never rendered")
-  local real = vim.fn.confirm
-  local asked = {}
+  assert(vim.wait(3000, function() return t.S.data end, 10), "status never rendered")
+  local real, asked = vim.fn.confirm, {}
   vim.fn.confirm = function(msg) asked[#asked + 1] = msg; return msg:find("not fully merged") and 2 or 1 end
   t.branches()
   local buf = vim.api.nvim_get_current_buf()
-  assert(vim.wait(3000, function() return vim.api.nvim_buf_line_count(buf) == 6 end, 10), "branch list never loaded")
-  local L = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  assert(vim.wait(3000, function() return vim.api.nvim_buf_line_count(buf) == 4 end, 10), "branch list never loaded")
   local id = {}
-  for _, l in ipairs(L) do id[l:match("^/%d+ (.*)$")] = l:match("^(/%d+ )") end
-  local new = { id.main .. "main", id.feat .. "renamed", id.feat .. "origin/feat", id.shared .. "shared",
-    id.unmerged .. "unmerged-x", "fresh" } -- gone + origin/shared dropped; unmerged renamed (kept)
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, new)
+  for _, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do id[l:match("^/%d+ (.*)$")] = l:match("^(/%d+ )") end
+  -- gone + unmerged dropped (unmerged: force declined, so it stays), feat renamed + copied, fresh new
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { id.main .. "main", id.feat .. "renamed", id.feat .. "copy", "fresh" })
   vim.cmd("write")
-  assert(vim.wait(5000, function() return not vim.bo[buf].modified and vim.api.nvim_buf_get_lines(buf, 0, -1, false)[1]:match("^/1 ") end, 20), "save never finished")
-  vim.wait(300, function() return false end, 20)
+  assert(vim.wait(5000, function() return not vim.bo[buf].modified and vim.api.nvim_buf_line_count(buf) == 5 end, 20), "save never finished")
   vim.fn.confirm = real
-  local function refs(p) return vim.split(vim.trim(g({ "for-each-ref", "--format=%(refname:short)", p })), "\n") end
-
-  local loc, rem = refs("refs/heads"), vim.trim(vim.system({ "git", "for-each-ref", "--format=%(refname:short)" }, { cwd = bare, text = true }):wait().stdout)
+  local loc = vim.split(vim.trim(g({ "for-each-ref", "--format=%(refname:short)", "refs/heads" })), "\n")
   table.sort(loc)
-  eq(loc, { "fresh", "main", "renamed", "shared", "unmerged-x" })
-  eq(rem, "feat") -- shared deleted on the remote, feat pushed
-  assert(asked[1]:find("delete  origin/shared (remote)", 1, true), "summary missing remote delete: " .. asked[1])
+  eq(loc, { "copy", "fresh", "main", "renamed", "unmerged" })
+  assert(asked[1]:find("rename  feat → renamed", 1, true), "summary: " .. asked[1])
+  assert(asked[2] and asked[2]:find("unmerged is not fully merged", 1, true), "no force prompt")
   vim.cmd("normal q")
   vim.cmd.cd(cwd)
-  vim.fn.delete(rdir, "rf"); vim.fn.delete(bare, "rf")
+  vim.fn.delete(rdir, "rf")
 end)
 
 vim.fn.delete(dir, "rf")
