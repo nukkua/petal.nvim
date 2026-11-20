@@ -758,6 +758,15 @@ test("branch_plan: dd deletes, yy+p copies, edit renames, new line creates, edge
   eq(ops({ "/1 main", "/2 origin/feat", "/3 gone" }), "origin/feat looks like a remote branch (remote branches: b R)")
 end)
 
+test("remote_unsafe: only a merged PR, no local branch, not the default", function()
+  local o = { name = "origin/x" }
+  local m = { state = "MERGED" }
+  eq(t.remote_unsafe(o, m), nil)
+  assert(t.remote_unsafe(o, nil) and t.remote_unsafe(o, { state = "OPEN" }) and t.remote_unsafe(o, { state = "MERGED", isDraft = true }))
+  assert(t.remote_unsafe({ name = "origin/x", has_local = true }, m))
+  assert(t.remote_unsafe({ name = "origin/main", default = true }, m))
+end)
+
 test("branches buffer: :w deletes, renames, copies, creates; one dialog flags unmerged", function()
   local rdir, g = repo()
   vim.fn.writefile({ "x" }, rdir .. "/x.txt")
@@ -834,13 +843,31 @@ test("branches: deleting asks to delete the upstream, never the default or a sha
   vim.wait(5000, function() return #rem() == 2 end, 50) -- the push runs in the background
   eq(rem(), { "main", "twin" })
   vim.cmd("normal q")
+  -- remote cleanup: only a merged PR with no local branch goes (twin: twin2 tracks it; main: default)
+  g({ "branch", "done" }); g({ "push", "-q", "origin", "done" }); g({ "branch", "-D", "done" })
+  local merged = { state = "MERGED", number = 1 }
   t.branches("remote")
   buf = vim.api.nvim_get_current_buf()
-  assert(vim.wait(3000, function() return vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] ~= "" end, 10), "remote list never loaded")
-  local L = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  assert(vim.wait(3000, function() return vim.api.nvim_buf_line_count(buf) == 3 end, 10), "remote list never loaded")
+  local L = vim.tbl_map(function(l) return (l:gsub("^/%d+ ", "")) end, vim.api.nvim_buf_get_lines(buf, 0, -1, false))
   table.sort(L)
-  eq(L, { "origin/main", "origin/twin" }) -- no origin/HEAD, no ids
-  eq(vim.bo[buf].modifiable, false)
+  eq(L, { "origin/done", "origin/main", "origin/twin" }) -- no origin/HEAD
+  vim.wait(200) -- let any gh call in flight land, then stand in for it
+  t.S.branch_prs = { root = t.S.root, at = vim.uv.now(), map = { done = merged, twin = merged, main = merged } }
+  vim.cmd("normal X")
+  eq(vim.api.nvim_buf_line_count(buf), 2)
+  local twin, cleaned = nil, vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for i, l in ipairs(cleaned) do if l:match(" origin/twin$") then twin = i end end
+  vim.api.nvim_buf_set_lines(buf, twin - 1, twin, false, {}) -- unsafe: refused, nothing pushed
+  vim.cmd("write")
+  eq(vim.bo[buf].modified, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, cleaned) -- API edits share one undo block: restore by hand
+  vim.fn.confirm = function(msg) asked[#asked + 1] = msg; return 1 end
+  vim.cmd("write")
+  vim.fn.confirm = real
+  vim.wait(5000, function() return #rem() == 1 end, 50)
+  eq(rem(), { "main", "twin" })
+  assert(asked[#asked]:find("delete  origin/done", 1, true), "dialog: " .. asked[#asked])
   vim.cmd("normal q")
   vim.cmd.cd(cwd)
   vim.fn.delete(rdir, "rf"); vim.fn.delete(bare, "rf")

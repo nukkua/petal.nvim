@@ -2450,8 +2450,16 @@ local function branch_prs(cb)
   end)
 end
 
--- bottom list of branches, same look for both kinds. "local": oil-style, each line "/<id> <name>"
--- (the concealed id says which branch it came from; :w applies). "remote": read-only, <CR> checks out
+-- remote list: a line may go only when its PR merged and nothing local still has it. nil = safe
+-- shortcut: PRs are matched by head name only, so a merged fork PR with the same name counts; check the remote if that matters
+local function remote_unsafe(o, pr)
+  if not pr or pr_state(pr) ~= "MERGED" then return o.name .. " has no merged PR" end
+  if o.has_local then return o.name .. " still has a local branch (delete it in b l first)" end
+  if o.default then return o.name .. " is the remote's default or a base branch" end
+end
+
+-- bottom list of branches, same look for both kinds, oil-style: each line "/<id> <name>" (the
+-- concealed id says which branch it came from; :w applies). "remote": only deletes of merged ones
 local function branches(kind)
   local set, edit = S.data and S.data.remoteset or {}, kind == "local"
   local buf, orig = S.branch_buf, {}
@@ -2464,12 +2472,12 @@ local function branches(kind)
   local src = vim.api.nvim_get_current_win()
   buf = vim.api.nvim_create_buf(false, true)
   S.branch_buf, vim.b[buf].petal_kind = buf, kind
-  vim.bo[buf].buftype, vim.bo[buf].bufhidden, vim.bo[buf].filetype = edit and "acwrite" or "nofile", "hide", "petalbranches"
+  vim.bo[buf].buftype, vim.bo[buf].bufhidden, vim.bo[buf].filetype = "acwrite", "hide", "petalbranches"
   pcall(vim.api.nvim_buf_set_name, buf, "git://branches/" .. kind)
   local win = vim.api.nvim_open_win(buf, true, { split = "below", win = -1, height = C.height })
   local w = vim.wo[win][0]
   w.number, w.conceallevel, w.concealcursor, w.winfixheight = true, 3, "nvic", true
-  w.statusline = edit and " Local branches  %m  (:w applies)" or " Remote branches  (<CR> checks out)"
+  w.statusline = edit and " Local branches  %m  (:w applies)" or " Remote branches  %m  (dd/X merged ones, :w deletes)"
   vim.cmd([[syntax match PetalBranchId /^\/\d\+ / conceal]])
   local bns = vim.api.nvim_create_namespace("petal.branches")
 
@@ -2486,7 +2494,7 @@ local function branches(kind)
         { tag, "GitBranchHead" }, { (" "):rep(12 - vim.api.nvim_strwidth(tag)) }, { ("%-4s "):format(o.age), "GitSubtleText" } }
       if pr then vt[#vt + 1] = { "#" .. str(pr.number, "?") .. " " .. s:lower() .. " ", PR_STATE[s] or "Comment" } end
       vt[#vt + 1] = { o.subject, "GitSubtleText" }
-      local p = edit and #("/" .. o.id .. " ") or 0
+      local p = #("/" .. o.id .. " ")
       vim.api.nvim_buf_set_extmark(buf, bns, i - 1, 0, { invalidate = true, undo_restore = false, virt_text = vt,
         end_col = o.current and p + #o.name or nil, hl_group = o.current and "GitBranchHead" or nil })
     end
@@ -2494,33 +2502,43 @@ local function branches(kind)
 
   local first
   local function load()
-    git({ "for-each-ref", "--sort=-committerdate", edit and "refs/heads" or "refs/remotes",
+    -- the remote list reads refs/heads too: which remote branches a local one still has
+    git({ "for-each-ref", "--sort=-committerdate", "refs/heads", edit and "refs/heads" or "refs/remotes",
       "--format=%(refname:short)%09%(objectname)%09%(HEAD)%09%(committerdate:unix)%09%(upstream:short)%09"
-        .. "%(upstream:remotename)%09%(upstream:remoteref)%09%(contents:subject)" }, nil, function(r)
+        .. "%(upstream:remotename)%09%(upstream:remoteref)%09%(refname)%09%(symref:short)%09%(contents:subject)" }, nil, function(r)
       if not vim.api.nvim_buf_is_valid(buf) then return end
       orig = {}
-      local L = {}
+      local L, locals, defaults = {}, {}, {}
       for _, l in ipairs(lines(r.stdout)) do
         local f = vim.split(l, "\t", { plain = true })
         local name = f[1]
         local rem, short = name:match("^([^/]+)/(.+)$")
+        if #f < 10 then -- malformed line: skip
+        elseif not edit and f[8]:match("^refs/heads/") then
+          locals[name] = true
+          if f[5] ~= "" then locals[f[5]] = true end
+        elseif not edit and short == "HEAD" then defaults[f[9]] = true
         -- remote list: only configured remotes, never <remote>/HEAD
-        if #f >= 8 and (edit or (rem and set[rem] and short ~= "HEAD")) then
+        elseif edit or (rem and set[rem]) then
           local up = f[5] ~= "" and f[5] or nil
-          local o = { id = #orig + 1, name = name, sha = f[2], head = f[3] == "*", age = age(f[4]), upstream = up,
-            up_remote = f[6], up_ref = f[7], subject = table.concat(f, "\t", 8) }
+          local o = { id = #orig + 1, name = name, short = short, sha = f[2], head = f[3] == "*", age = age(f[4]), upstream = up,
+            up_remote = f[6], up_ref = f[7], subject = table.concat(f, "\t", 10) }
           -- a PR's head is the branch on the remote: the upstream's name when there is one
           o.pr_key = edit and (up and f[7]:gsub("^refs/heads/", "") or name) or short
           -- current: the checked-out branch, or in the remote list its upstream
           o.current = edit and o.head or (not edit and S.data and S.data.st.upstream == name)
           orig[#orig + 1] = o
-          L[#L + 1] = edit and ("/" .. o.id .. " " .. name) or name
+          L[#L + 1] = "/" .. o.id .. " " .. name
         end
+      end
+      for _, o in ipairs(edit and {} or orig) do
+        o.has_local = locals[o.name] or locals[o.short]
+        o.default = defaults[o.name] or vim.tbl_contains(C.base_branches, o.name)
       end
       local cur = vim.api.nvim_win_get_buf(0) == buf and vim.api.nvim_win_get_cursor(0)
       vim.bo[buf].modifiable = true
       vim.api.nvim_buf_set_lines(buf, 0, -1, false, L)
-      vim.bo[buf].modifiable, vim.bo[buf].modified = edit, false
+      vim.bo[buf].modified = false
       decorate(S.branch_prs and S.branch_prs.root == S.root and S.branch_prs.map)
       branch_prs(function(prs) if vim.api.nvim_buf_is_valid(buf) then decorate(prs) end end)
       if not first and cur then -- first load: start on the current branch
@@ -2591,6 +2609,27 @@ local function branches(kind)
     end)
   end
 
+  local function prs() return S.branch_prs and S.branch_prs.root == S.root and S.branch_prs.map or {} end
+  -- remote: only deletes, each one safe (remote_unsafe), all asked in one dialog, one push per remote
+  local function save_remote()
+    local plan, why = branch_plan(orig, vim.api.nvim_buf_get_lines(buf, 0, -1, false), {})
+    if not plan then return notify("remote branches: " .. why, vim.log.levels.WARN) end
+    if #plan == 0 then vim.bo[buf].modified = false; return end
+    local by, text = {}, {}
+    for _, op in ipairs(plan) do
+      if op.op ~= "delete" then return notify("remote branches: only deletes (dd), undo the other edits with u", vim.log.levels.WARN) end
+      local o = op.src
+      local no = remote_unsafe(o, prs()[o.pr_key])
+      if no then return notify("remote branches: " .. no .. ", undo with u", vim.log.levels.WARN) end
+      local rm = o.name:match("^([^/]+)/")
+      by[rm] = by[rm] or {}
+      table.insert(by[rm], o.short)
+      text[#text + 1] = "delete  " .. o.name
+    end
+    if not confirm("Delete on the remote (PR merged, no local branch)?\n" .. table.concat(text, "\n")) then return end
+    for rm, names in pairs(by) do act(cat({ "push", rm, "--delete" }, names), { msg = "Deleting on " .. rm, after = load }) end
+  end
+
   local function close()
     S.branch_buf = nil
     pcall(vim.api.nvim_buf_delete, buf, { force = true }) -- closes the split too
@@ -2610,8 +2649,23 @@ local function branches(kind)
     act({ "switch", edit and b.name or (b.name:gsub("^[^/]+/", "")) })
     close()
   end, o)
-  if edit then
-    vim.api.nvim_create_autocmd("BufWriteCmd", { buffer = buf, callback = save })
+  vim.api.nvim_create_autocmd("BufWriteCmd", { buffer = buf, callback = edit and save or save_remote })
+  if not edit then
+    -- the cleanup in one key: drop every line that is safe to delete, then :w
+    vim.keymap.set("n", "X", function()
+      local n = 0
+      for i = vim.api.nvim_buf_line_count(buf), 1, -1 do -- bottom up: line numbers stay valid
+        local l = vim.api.nvim_buf_get_lines(buf, i - 1, i, false)[1]
+        local b = orig[tonumber(l:match("^/(%d+) ") or "")]
+        if b and l == "/" .. b.id .. " " .. b.name and not remote_unsafe(b, prs()[b.pr_key]) then
+          vim.api.nvim_buf_set_lines(buf, i - 1, i, false, {})
+          n = n + 1
+        end
+      end
+      notify(n > 0 and ("remote branches: " .. n .. " merged, :w deletes them") or "remote branches: nothing merged to clean")
+    end, o)
+  end
+  do
     -- keep the cursor off the hidden id, so cw/I/0 edit the name only
     vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, { buffer = buf, callback = function()
       local r, col = unpack(vim.api.nvim_win_get_cursor(0))
@@ -3385,7 +3439,7 @@ M._t = {
     return t
   end,
   bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, git_batch = git_batch, paint = paint, ns = ns, untracked_diff = untracked_diff, hunk_owner = hunk_owner, parse_conflicts = parse_conflicts,
-  parse_files = parse_files, patch = patch, branch_plan = branch_plan, branches = branches, kind_of = kind_of, ci_summary = ci_summary, failure = failure, cut = cut, refchunks = refchunks, S = S,
+  parse_files = parse_files, patch = patch, branch_plan = branch_plan, branches = branches, remote_unsafe = remote_unsafe, kind_of = kind_of, ci_summary = ci_summary, failure = failure, cut = cut, refchunks = refchunks, S = S,
 }
 
 return M

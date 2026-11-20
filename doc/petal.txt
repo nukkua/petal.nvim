@@ -208,6 +208,14 @@ names in two saves), `<remote>/…` names, and invalid names. The first failing
 step stops the rest; the list then reloads to show what was done. <CR> and
 `q` ask you to save or undo first.
 
+The remote list is edited the same way, for cleanup only: `dd` a branch whose
+PR badge says merged, or `X` to drop every such line at once, then `:w` asks
+once and runs one `git push --delete` per remote. Refused (the save does
+nothing): any other edit, a branch without a merged PR, one a local branch
+still has (same name or its upstream: delete that in `b l` first), and the
+remote's default branch or |petal-opt-base_branches|. PRs are matched by head
+branch name, so the list needs `gh`.
+
 Log views get the popup keys (`$` to `Z` above) plus goto and help; commit and
 diff views also get the fold keys.
 
