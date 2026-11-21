@@ -3027,6 +3027,10 @@ function P.stash()
         { "p", "Pop", function(_, ctx) target(ctx, function(z) act({ "stash", "pop", "--index", z }) end) end },
         { "a", "Apply", function(_, ctx) target(ctx, function(z) act({ "stash", "apply", "--index", z }) end) end },
         { "d", "Drop", function(_, ctx) target(ctx, function(z) if confirm("Drop " .. z .. "?") then act({ "stash", "drop", z }) end end) end },
+        -- new branch at the commit the stash was made on, so it applies cleanly; drops the stash on success
+        { "b", "Branch", function(_, ctx)
+          target(ctx, function(z) input("Branch name: ", nil, function(n) act({ "stash", "branch", n, z }) end) end)
+        end },
       } },
     } })
 end
