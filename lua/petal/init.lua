@@ -2271,12 +2271,30 @@ local function vimdiff()
   end)
 end
 
+-- closes the d diff: save true writes the working file if modified (ZZ), false drops its unsaved edits (ZQ), nil leaves it.
+-- reload before diffoff!: a failed write keeps the diff open, like Vim's ZZ (maps survive edit!/write, so they are deleted here)
+local function diff_close(save)
+  local bufs = vim.tbl_filter(function(b) return vim.b[b].git_work_diff or vim.b[b].git_head_scratch end, vim.api.nvim_list_bufs())
+  for _, b in ipairs(bufs) do -- nofile (deleted in the worktree): nothing to write or reload
+    if save ~= nil and vim.b[b].git_work_diff and vim.bo[b].buftype == "" and vim.bo[b].modified then
+      vim.api.nvim_buf_call(b, function() vim.cmd(save and "silent write" or "silent edit!") end)
+    end
+  end
+  vim.cmd("diffoff!")
+  for _, w in ipairs(vim.api.nvim_list_wins()) do
+    local b = vim.api.nvim_win_get_buf(w)
+    if vim.b[b].git_work_diff or vim.b[b].git_head_scratch then vim.api.nvim_set_option_value("winbar", "", { win = w }) end
+  end
+  for _, b in ipairs(bufs) do
+    for _, k in ipairs({ "ZZ", "ZQ" }) do pcall(vim.keymap.del, "n", k, { buffer = b }) end
+    if vim.b[b].git_head_scratch then vim.api.nvim_buf_delete(b, { force = true }) else vim.b[b].git_work_diff = nil end
+  end
+  return #bufs > 0
+end
+
 function vimdiff_open(root, rel, head)
   -- ponytail: one diff at a time; repeat-d replaces instead of stacking splits
-  vim.cmd("diffoff!")
-  for _, b in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.b[b].git_head_scratch then vim.api.nvim_buf_delete(b, { force = true }) end
-  end
+  diff_close()
   local abs = root .. "/" .. rel
   if vim.fn.filereadable(abs) == 1 then
     vim.cmd("edit " .. vim.fn.fnameescape(abs))
@@ -2285,12 +2303,12 @@ function vimdiff_open(root, rel, head)
     vim.bo.buftype = "nofile"
   end
   vim.b.git_work_diff = true
-  local work_win = vim.api.nvim_get_current_win()
+  local work_win, work_buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
   local ft = vim.bo.filetype
   vim.cmd("diffthis")
   vim.api.nvim_set_option_value("winbar", "%#Comment# working %*", { win = work_win })
   vim.cmd("vnew")
-  local head_win = vim.api.nvim_get_current_win()
+  local head_win, head_buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
   vim.api.nvim_buf_set_lines(0, 0, -1, false, head)
   pcall(vim.api.nvim_buf_set_name, 0, "HEAD:" .. rel)
   vim.bo.filetype = ft
@@ -2303,25 +2321,16 @@ function vimdiff_open(root, rel, head)
   vim.b.git_head_scratch = true
   vim.cmd("diffthis")
   vim.api.nvim_set_option_value("winbar", "%#Comment# head %*", { win = head_win })
+  local function close(save) return function() diff_close(save); M.open() end end
+  for _, b in ipairs({ work_buf, head_buf }) do
+    vim.keymap.set("n", "ZZ", close(true), { buffer = b, nowait = true })
+    vim.keymap.set("n", "ZQ", close(false), { buffer = b, nowait = true })
+  end
 end
 
--- :DiffOff closes the diff (HEAD split + labels) and goes back to the status
+-- :DiffOff closes the diff (HEAD split + labels) and goes back to the status; ZZ/ZQ in the diff do the same after saving/dropping the edits
 vim.api.nvim_create_user_command("DiffOff", function()
-  local closed = false
-  vim.cmd("diffoff!")
-  for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-    local b = vim.api.nvim_win_get_buf(w)
-    if vim.b[b].git_head_scratch or vim.b[b].git_work_diff then
-      vim.api.nvim_set_option_value("winbar", "", { win = w })
-      if vim.b[b].git_head_scratch then
-        vim.api.nvim_buf_delete(b, { force = true })
-      else
-        vim.b[b].git_work_diff = nil
-      end
-      closed = true
-    end
-  end
-  if closed then M.open() end
+  if diff_close() then M.open() end
 end, { desc = "Close diff, back to git status" })
 
 ---------------------------------------------------------------- popups

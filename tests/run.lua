@@ -995,6 +995,62 @@ test("merge_mode: c-keys resolve on a marker, stay Vim's elsewhere; ZZ stages", 
   vim.fn.delete(cdir, "rf")
 end)
 
+test("d: ZZ from the HEAD pane writes the file and returns, ZQ drops the edit; then they are Vim's", function()
+  local rdir, g = repo()
+  local f = rdir .. "/v.txt"
+  vim.fn.writefile({ "head" }, f); g({ "add", "." }); g({ "commit", "-qm", "base" })
+  vim.fn.writefile({ "work" }, f); g({ "add", "." }) -- staged only: git diff is empty until ZZ writes
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  petal.open()
+  local function open_diff(pat)
+    assert(shown(pat), "status never listed " .. pat)
+    vim.fn.cursor(vim.fn.search(pat, "nw"), 1)
+    vim.api.nvim_feedkeys("d", "x", false)
+    assert(vim.wait(3000, function() return vim.fn.bufnr("HEAD:v.txt") ~= -1 end, 10), "d: no HEAD side")
+  end
+  local function zmap(buf, k) return vim.api.nvim_buf_call(buf, function() return vim.fn.maparg(k, "n") end) end
+  -- ZZ from the HEAD pane
+  open_diff("modified.*v\\.txt")
+  local fbuf = vim.fn.bufnr(f)
+  vim.api.nvim_buf_set_lines(fbuf, 0, -1, false, { "edited" })
+  vim.api.nvim_set_current_win(vim.fn.bufwinid(vim.fn.bufnr("HEAD:v.txt")))
+  vim.api.nvim_feedkeys("ZZ", "x", false)
+  eq(vim.fn.readfile(f), { "edited" }, "ZZ did not write the file")
+  eq(g({ "diff", "--name-only" }), "v.txt\n", "git diff does not list the file")
+  eq(vim.fn.bufnr("HEAD:v.txt"), -1, "HEAD scratch left behind")
+  eq(zmap(fbuf, "ZZ"), "", "ZZ map stayed on the file buffer")
+  -- ZQ (from the working pane) leaves the file on disk unchanged
+  open_diff("modified.*v\\.txt")
+  vim.api.nvim_buf_set_lines(fbuf, 0, -1, false, { "dropped" })
+  vim.api.nvim_set_current_win(vim.fn.bufwinid(fbuf))
+  vim.api.nvim_feedkeys("ZQ", "x", false)
+  eq(vim.fn.readfile(f), { "edited" }, "ZQ changed the file on disk")
+  eq(vim.api.nvim_buf_get_lines(fbuf, 0, -1, false), { "edited" }, "ZQ kept the edit in the buffer")
+  eq(vim.fn.bufnr("HEAD:v.txt"), -1, "HEAD scratch left behind")
+  eq(zmap(fbuf, "ZQ"), "", "ZQ map stayed on the file buffer")
+  -- :DiffOff clears the maps too
+  open_diff("modified.*v\\.txt")
+  vim.cmd("DiffOff")
+  eq(zmap(fbuf, "ZZ"), "", ":DiffOff left the ZZ map")
+  -- deleted in the worktree: the working side is a nofile buffer, ZZ closes without writing or throwing
+  vim.fn.delete(f)
+  petal.open()
+  open_diff("deleted.*v\\.txt")
+  local wbuf
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do if vim.b[b].git_work_diff then wbuf = b end end
+  assert(wbuf, "d on a deleted file: no working side")
+  vim.api.nvim_buf_set_lines(wbuf, 0, -1, false, { "x" })
+  vim.v.errmsg = ""
+  vim.api.nvim_set_current_win(vim.fn.bufwinid(wbuf))
+  vim.api.nvim_feedkeys("ZZ", "x", false)
+  eq(vim.v.errmsg, "", "ZZ on the nofile side raised: " .. vim.v.errmsg)
+  eq(vim.fn.bufnr("HEAD:v.txt"), -1, "HEAD scratch left behind")
+  eq(vim.fn.filereadable(f), 0, "ZZ wrote the deleted file")
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+end)
+
 vim.fn.delete(dir, "rf")
 print(("%d/%d passed"):format(n - fails, n))
 os.exit(fails > 0 and 1 or 0)

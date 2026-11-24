@@ -99,7 +99,8 @@ simple                                                    *petal-opt-simple*
 
                                                                     *:DiffOff*
 :DiffOff                Close the diff opened with `d` and go back to the
-                        status.
+                        status, leaving the file as it is. `ZZ`/`ZQ` in the
+                        diff do the same after saving/dropping the edits.
 
 Lua: `require("petal").open()`, `require("petal").command("log -5")`.
 
@@ -146,7 +147,10 @@ Key     Action           Does ~
                          last touched its lines, see |petal-absorb|
 `o`     move_hunk        In a commit view: move the hunk (or file) under the
                          cursor to another unpushed commit, see |petal-move|
-`d`     diff             Vimdiff of the file vs HEAD
+`d`     diff             Vimdiff of the file vs HEAD (working | head)
+                         `ZZ` saves the file and closes, `ZQ` drops its
+                         unsaved edits (also those made before `d`) and
+                         closes, from either pane; then they are plain Vim
 `e`     merge_mode       Resolve a conflicted file (ours | theirs above)
                          `co`/`ct`/`cb`/`c0` per block, `cO`/`cT` all ours/theirs,
                          with the cursor on a marker line (`<<<<<<<`, `=======`,
