@@ -158,7 +158,7 @@ Key     Action           Does ~
                          The marker lines and panes say who ours/theirs are
                          (in a rebase ours is the upstream) and how old each
                          side is. Under 160 columns or 36 lines only the file
-                         opens; `cv` shows/hides the panes
+                         opens; `cp` shows/hides the panes
 <C-r>   refresh          Refresh
 <CR>    goto             Open the file at that line, or the commit/stash
 `za`    toggle_fold      Toggle fold
