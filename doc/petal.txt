@@ -148,9 +148,17 @@ Key     Action           Does ~
                          cursor to another unpushed commit, see |petal-move|
 `d`     diff             Vimdiff of the file vs HEAD
 `e`     merge_mode       Resolve a conflicted file (ours | theirs above)
-                         `co`/`ct`/`cb`/`c0` per block, `cO`/`cT` all ours/theirs
-                         Windows say who ours/theirs are (in a rebase ours is
-                         the upstream) and how old each side is
+                         `co`/`ct`/`cb`/`c0` per block, `cO`/`cT` all ours/theirs,
+                         with the cursor on a marker line (`<<<<<<<`, `=======`,
+                         ...); anywhere else they are plain Vim (`ct,` works)
+                         `]c`/`[c` jump conflicts, Vim's diff jump when none
+                         is left in that direction
+                         `ZZ` saves and closes, `ZQ` drops unsaved edits and
+                         closes (`q` is left for macros)
+                         The marker lines and panes say who ours/theirs are
+                         (in a rebase ours is the upstream) and how old each
+                         side is. Under 160 columns or 36 lines only the file
+                         opens; `cv` shows/hides the panes
 <C-r>   refresh          Refresh
 <CR>    goto             Open the file at that line, or the commit/stash
 `za`    toggle_fold      Toggle fold

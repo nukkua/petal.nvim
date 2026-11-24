@@ -722,6 +722,8 @@ test("d and e open their views once git answers (no blocking calls)", function()
   assert(shown("unmerged.*m.txt"), "conflict not listed")
   vim.fn.cursor(vim.fn.search("unmerged.*m\\.txt", "nw"), 1)
   local tabs = #vim.api.nvim_list_tabpages()
+  local oc, ol = vim.o.columns, vim.o.lines
+  vim.o.columns, vim.o.lines = 200, 50 -- e's panes open by themselves only on a big screen
   vim.api.nvim_feedkeys("e", "x", false)
   assert(vim.wait(3000, function() return #vim.api.nvim_tabpage_list_wins(0) == 3 end, 10), "e: merge windows never opened")
   assert(#vim.api.nvim_list_tabpages() == tabs + 1, "e: no merge tab")
@@ -729,6 +731,49 @@ test("d and e open their views once git answers (no blocking calls)", function()
   for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do bars[#bars + 1] = vim.wo[w].winbar end
   assert(table.concat(bars, "\n"):find("ours  main", 1, true), "e: ours label missing: " .. table.concat(bars, " | "))
   vim.cmd("diffoff! | tabclose")
+  vim.o.columns, vim.o.lines = oc, ol
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+end)
+
+test("e on a small screen opens just the file; cv toggles the ours | theirs panes", function()
+  local oc, ol = vim.o.columns, vim.o.lines
+  vim.o.columns, vim.o.lines = 100, 30
+  local rdir, g = repo()
+  vim.fn.writefile({ "base" }, rdir .. "/m.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "base" })
+  g({ "switch", "-qc", "other" }); vim.fn.writefile({ "theirs" }, rdir .. "/m.txt"); g({ "commit", "-qam", "theirs" })
+  g({ "switch", "-q", "main" }); vim.fn.writefile({ "ours" }, rdir .. "/m.txt"); g({ "commit", "-qam", "ours" })
+  vim.system({ "git", "merge", "other" }, { cwd = rdir }):wait() -- conflicts on m.txt
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  petal.open()
+  assert(shown("unmerged.*m.txt"), "conflict not listed")
+  vim.fn.cursor(vim.fn.search("unmerged.*m\\.txt", "nw"), 1)
+  vim.api.nvim_feedkeys("e", "x", false)
+  local mwin
+  assert(vim.wait(3000, function()
+    local w = vim.api.nvim_tabpage_list_wins(0)
+    if #w == 1 and vim.wo[w[1]].winbar:find("cv", 1, true) then mwin = w[1]; return true end
+  end, 10), "e: merge setup never ran")
+  eq(#vim.api.nvim_tabpage_list_wins(0), 1, "compact: expected only the file window")
+  local mbuf, srow, erow = vim.api.nvim_win_get_buf(mwin)
+  for i, l in ipairs(vim.api.nvim_buf_get_lines(mbuf, 0, -1, false)) do
+    if l:match("^<<<<<<<") then srow = i elseif l:match("^>>>>>>>") then erow = i end
+  end
+  local ns, marks = vim.api.nvim_create_namespace("petal_merge"), {}
+  for _, m in ipairs(vim.api.nvim_buf_get_extmarks(mbuf, ns, 0, -1, { details = true })) do
+    if m[4].virt_text and m[4].virt_text[1] then marks[m[2] + 1] = m[4].virt_text[1][1] end
+  end
+  assert(marks[srow] and vim.startswith(marks[srow], "ours  main"), "ours label: " .. tostring(marks[srow]))
+  assert(marks[erow] and vim.startswith(marks[erow], "theirs  other"), "theirs label: " .. tostring(marks[erow]))
+  vim.api.nvim_feedkeys("cv", "x", false)
+  assert(vim.wait(3000, function() return #vim.api.nvim_tabpage_list_wins(0) == 3 end, 10), "cv: panes never opened")
+  eq(vim.api.nvim_get_current_win(), mwin, "cv: focus left the file window")
+  vim.api.nvim_feedkeys("cv", "x", false)
+  eq(#vim.api.nvim_tabpage_list_wins(0), 1, "cv: panes did not close")
+  vim.cmd("diffoff! | tabclose")
+  vim.o.columns, vim.o.lines = oc, ol
   vim.cmd.cd(cwd)
   vim.fn.delete(rdir, "rf")
 end)
@@ -871,6 +916,53 @@ test("branches: deleting asks to delete the upstream, never the default or a sha
   vim.cmd("normal q")
   vim.cmd.cd(cwd)
   vim.fn.delete(rdir, "rf"); vim.fn.delete(bare, "rf")
+end)
+
+test("merge_mode: c-keys resolve on a marker, stay Vim's elsewhere; ZZ stages", function()
+  local cdir = vim.fn.tempname()
+  vim.fn.mkdir(cdir, "p")
+  local function cgit(args) return vim.system(vim.list_extend({ "git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false" }, args), { cwd = cdir, text = true }):wait() end
+  local f = cdir .. "/a.txt"
+  cgit({ "init", "-q", "-b", "main" })
+  vim.fn.writefile({ "top", "x", "end" }, f); cgit({ "add", "." }); cgit({ "commit", "-qm", "base" })
+  cgit({ "checkout", "-qb", "other" })
+  vim.fn.writefile({ "top", "theirs, side", "end" }, f); cgit({ "commit", "-qam", "theirs" })
+  cgit({ "checkout", "-q", "main" })
+  vim.fn.writefile({ "top", "ours, side, more", "end" }, f); cgit({ "commit", "-qam", "ours" })
+  assert(cgit({ "merge", "-q", "other" }).code ~= 0, "merge should conflict")
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(cdir)
+  petal.open()
+  assert(vim.wait(5000, function() return vim.fn.search("a.txt", "w") > 0 end, 10), "conflicted file not listed")
+  local oc, ol = vim.o.columns, vim.o.lines
+  vim.o.columns, vim.o.lines = 200, 50 -- panes only open by themselves on a big screen
+  vim.api.nvim_feedkeys("e", "x", false)
+  assert(vim.wait(5000, function() return #vim.api.nvim_tabpage_list_wins(0) == 3 end, 10), "merge windows never opened")
+  local mbuf = vim.api.nvim_get_current_buf()
+  local function L() return vim.api.nvim_buf_get_lines(mbuf, 0, -1, false) end
+  -- content line: ct is Vim's change-till, and keeps its count (2ct, = up to the second comma)
+  vim.api.nvim_win_set_cursor(0, { vim.fn.search("^ours, side", "nw"), 0 })
+  vim.api.nvim_feedkeys("2ct,OURS" .. vim.keycode("<esc>"), "x", false)
+  assert(vim.tbl_contains(L(), "OURS, more"), "2ct, off a marker should edit: " .. vim.inspect(L()))
+  -- marker line: co keeps ours; a count before it must not leak into the next command
+  local mark = vim.fn.search("^<<<<<<<", "nw")
+  vim.api.nvim_win_set_cursor(0, { mark, 0 })
+  -- one typeahead, as typed: the x runs before the scheduled resolve, on the marker line
+  vim.api.nvim_feedkeys("3cox", "x", false)
+  eq(vim.fn.getline(mark), "<<<<<< HEAD", "x after 3co must delete one char (count leaked)")
+  vim.wait(200)
+  vim.api.nvim_buf_set_lines(mbuf, mark - 1, mark, false, { "<<<<<<< HEAD" }) -- undo the x by hand
+  vim.api.nvim_win_set_cursor(0, { mark, 0 })
+  vim.api.nvim_feedkeys("3co", "x", false)
+  vim.wait(1000, function() return #L() == 3 end, 10)
+  eq(L(), { "top", "OURS, more", "end" })
+  vim.api.nvim_feedkeys("ZZ", "x", false)
+  assert(vim.wait(5000, function() return cgit({ "diff", "--name-only", "--diff-filter=U" }).stdout == "" end, 20), "ZZ should stage the file")
+  eq(vim.fn.readfile(f), { "top", "OURS, more", "end" })
+  vim.o.columns, vim.o.lines = oc, ol
+  vim.cmd("normal q")
+  vim.cmd.cd(cwd)
+  vim.fn.delete(cdir, "rf")
 end)
 
 vim.fn.delete(dir, "rf")

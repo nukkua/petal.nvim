@@ -1995,9 +1995,10 @@ end
 
 ---------------------------------------------------------------- merge mode
 
--- e on a conflicted file: new tab, ours | theirs on top (diffed), the real file below with its
--- conflict blocks colored. co/ct/cb/c0 keep ours/theirs/both/none, cO/cT take ours/theirs for every block, q saves and returns
--- (staging the file when no markers are left). ]c [c jump conflicts here, like changes in the diffed windows
+-- e on a conflicted file: new tab, ours | theirs on top (diffed; under 160 columns or 36 lines the file
+-- opens alone and cv shows/hides the panes), the real file below with its conflict blocks colored and the
+-- marker lines labelled. co/ct/cb/c0 keep ours/theirs/both/none, cO/cT take ours/theirs for every block (on a marker line only, elsewhere they stay Vim's), ZZ saves and returns, ZQ drops unsaved edits and returns (q stays free for macros)
+-- (staging the file when no markers are left). ]c [c jump conflicts here, Vim's diff jump once none is left that way
 local mns = vim.api.nvim_create_namespace("petal_merge")
 
 local function blocks(buf)
@@ -2011,7 +2012,7 @@ local function blocks(buf)
   return out
 end
 
-local function paint_merge(buf)
+local function paint_merge(buf, labels)
   vim.api.nvim_buf_clear_namespace(buf, mns, 0, -1)
   for _, c in ipairs(blocks(buf)) do
     local function hl(a, b, g) for r = a, b do vim.api.nvim_buf_set_extmark(buf, mns, r - 1, 0, { line_hl_group = g }) end end
@@ -2019,8 +2020,14 @@ local function paint_merge(buf)
     hl(c.s + 1, (c.b or c.m) - 1, "GitMergeOurs")
     if c.b then hl(c.b + 1, c.m - 1, "GitMergeBase") end
     hl(c.m + 1, c.e - 1, "GitMergeTheirs")
+    if labels then
+      vim.api.nvim_buf_set_extmark(buf, mns, c.s - 1, 0, { virt_text = { { labels.ours, "Comment" } }, virt_text_pos = "eol" })
+      vim.api.nvim_buf_set_extmark(buf, mns, c.e - 1, 0, { virt_text = { { labels.theirs, "Comment" } }, virt_text_pos = "eol" })
+    end
   end
 end
+
+local function merge_compact() return vim.o.columns < 160 or vim.o.lines < 36 end
 
 -- who ours/theirs really are: in a rebase HEAD is the upstream and theirs is your commit being replayed.
 -- Both git calls run at once, async, and never walk history (for-each-ref --points-at, not name-rev).
@@ -2071,42 +2078,69 @@ local function merge_mode()
   local line = it.conflict and it.conflict.line
   vim.cmd.tabnew(vim.fn.fnameescape(abs))
   local mwin, mbuf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
-  local ft = vim.bo.filetype
-  -- ours, theirs and the side labels: four git calls at once, the windows open when all have answered
-  local stages, op, olabel, tlabel, left = {}, nil, nil, nil, 3
-  local build
-  local function ready()
-    left = left - 1
+  local ft, compact = vim.bo.filetype, merge_compact()
+  -- the ours | theirs panes open lazily (right away on a big screen, cv toggles them otherwise):
+  -- the stage contents load on first open and are cached for the next
+  local stages, swins, loading = {}, {}, false
+  merge_sides(function(op, olabel, tlabel)
     -- tab closed meanwhile: nothing to build into
-    if left == 0 and vim.api.nvim_win_is_valid(mwin) and vim.api.nvim_win_get_buf(mwin) == mbuf then build() end
-  end
-  for _, stage in ipairs({ 2, 3 }) do
-    git({ "show", ":" .. stage .. ":" .. rel }, nil, function(r) stages[stage] = r; ready() end)
-  end
-  merge_sides(function(...) op, olabel, tlabel = ...; ready() end)
-  function build()
-    local function side(stage, label, split)
-      vim.cmd(split)
-      local r = stages[stage]
-      local b = vim.api.nvim_create_buf(false, true)
-      vim.api.nvim_buf_set_lines(b, 0, -1, false, lines(r.stdout))
-      vim.bo[b].bufhidden, vim.bo[b].modifiable, vim.bo[b].filetype = "wipe", false, ft
-      pcall(vim.api.nvim_buf_set_name, b, label .. ":" .. rel)
-      vim.api.nvim_win_set_buf(0, b)
-      vim.cmd("diffthis")
-      vim.wo.winbar = "%#Comment# " .. label:gsub("%%", "%%%%") .. " %*"
-      return b
+    if not (vim.api.nvim_win_is_valid(mwin) and vim.api.nvim_win_get_buf(mwin) == mbuf) then return end
+    local done, toggle
+    local function build()
+      if not (vim.api.nvim_win_is_valid(mwin) and vim.api.nvim_win_get_buf(mwin) == mbuf) then return end
+      local pos = vim.api.nvim_win_get_cursor(mwin)
+      local function side(stage, label, split)
+        vim.cmd(split)
+        local r = stages[stage]
+        local b = vim.api.nvim_create_buf(false, true)
+        vim.api.nvim_buf_set_lines(b, 0, -1, false, lines(r.stdout))
+        vim.bo[b].bufhidden, vim.bo[b].modifiable, vim.bo[b].filetype = "wipe", false, ft
+        pcall(vim.api.nvim_buf_set_name, b, label .. ":" .. rel)
+        vim.api.nvim_win_set_buf(0, b)
+        vim.cmd("diffthis")
+        vim.wo.winbar = "%#Comment# " .. label:gsub("%%", "%%%%") .. " %*"
+        return b
+      end
+      vim.api.nvim_set_current_win(mwin)
+      local ours = side(2, olabel, "aboveleft split")
+      swins[1] = vim.api.nvim_get_current_win()
+      local theirs = side(3, tlabel, "rightbelow vsplit")
+      swins[2] = vim.api.nvim_get_current_win()
+      vim.api.nvim_win_set_height(swins[2], math.min(math.floor(vim.o.lines / 3), 15))
+      vim.api.nvim_set_current_win(mwin)
+      vim.api.nvim_win_set_cursor(mwin, pos)
+      for _, b in ipairs({ ours, theirs }) do
+        vim.keymap.set("n", "ZZ", function() done(true) end, { buffer = b, nowait = true })
+        vim.keymap.set("n", "ZQ", function() done(false) end, { buffer = b, nowait = true })
+        vim.keymap.set("n", "cv", toggle, { buffer = b, nowait = true })
+      end
     end
-    vim.api.nvim_set_current_win(mwin)
-    local ours = side(2, olabel, "aboveleft split")
-    local theirs = side(3, tlabel, "rightbelow vsplit")
-    vim.api.nvim_win_set_height(vim.api.nvim_get_current_win(), math.floor(vim.o.lines / 3))
-    vim.api.nvim_set_current_win(mwin)
-    vim.wo[mwin].winbar = "%#Comment# " .. (op and (op .. "  ") or "") .. "co ct cb c0  cO cT  ]c [c  q %*"
+    local function open_sides()
+      if loading then return end
+      if stages[2] and stages[3] then return build() end
+      loading = true
+      local left = 2
+      for _, stage in ipairs({ 2, 3 }) do
+        git({ "show", ":" .. stage .. ":" .. rel }, nil, function(r)
+          stages[stage], left = r, left - 1
+          if left == 0 then loading = false; build() end
+        end)
+      end
+    end
+    local function close_sides()
+      for _, w in ipairs(swins) do if vim.api.nvim_win_is_valid(w) then vim.api.nvim_win_close(w, true) end end
+      if vim.api.nvim_win_is_valid(mwin) then vim.api.nvim_set_current_win(mwin) end
+    end
+    function toggle()
+      for _, w in ipairs(swins) do if vim.api.nvim_win_is_valid(w) then return close_sides() end end
+      open_sides()
+    end
+    vim.wo[mwin].winbar = "%#Comment# " .. (op and (op .. "  ") or "") .. "on a marker: co ct cb c0  cO cT  ]c [c  cv  ZZ ZQ %*"
 
     local aug = vim.api.nvim_create_augroup("petal_merge", { clear = true })
-    paint_merge(mbuf)
-    vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, { group = aug, buffer = mbuf, callback = function() paint_merge(mbuf) end })
+    local labels = { ours = olabel, theirs = tlabel }
+    paint_merge(mbuf, labels)
+    vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, { group = aug, buffer = mbuf, callback = function() paint_merge(mbuf, labels) end })
 
     local function jump(dir)
       local cur, list = vim.fn.line("."), blocks(mbuf)
@@ -2139,12 +2173,12 @@ local function merge_mode()
       end
       notify("merge: cursor is not inside a conflict", vim.log.levels.WARN)
     end
-    local function done()
-      if vim.bo[mbuf].modified then vim.api.nvim_buf_call(mbuf, function() vim.cmd("silent write") end) end
+    local function done(save)
+      if vim.bo[mbuf].modified then vim.api.nvim_buf_call(mbuf, function() vim.cmd(save and "silent write" or "silent edit!") end) end
       local left = #blocks(mbuf)
       vim.api.nvim_del_augroup_by_id(aug)
       vim.api.nvim_buf_clear_namespace(mbuf, mns, 0, -1)
-      for _, k in ipairs({ "co", "ct", "cb", "c0", "cO", "cT", "]c", "[c", "q" }) do pcall(vim.keymap.del, "n", k, { buffer = mbuf }) end
+      for _, k in ipairs({ "co", "ct", "cb", "c0", "cO", "cT", "]c", "[c", "cv", "ZZ", "ZQ" }) do pcall(vim.keymap.del, "n", k, { buffer = mbuf }) end
       vim.cmd("diffoff! | tabclose")
       if left == 0 then
         act({ "add", "--", rel }, { after = function() notify("merge: " .. rel .. " resolved and staged") end })
@@ -2153,18 +2187,44 @@ local function merge_mode()
         M.refresh()
       end
     end
+    -- the keys act only where Vim's own meaning is useless, otherwise they stay Vim's (ct, cb, c0, cT, ]c, [c).
+    -- expr so the fallback keeps its count and register; the action is scheduled (expr maps can't edit text)
+    local function map(lhs, here, fn)
+      vim.keymap.set("n", lhs, function()
+        if not here() then return lhs end
+        vim.schedule(fn)
+        return "<Cmd><CR>" -- ends the command so a count typed before it is dropped (<Ignore> would leak it)
+      end, { buffer = mbuf, expr = true })
+    end
+    local function on_marker()
+      local cur = vim.fn.line(".")
+      for _, c in ipairs(blocks(mbuf)) do
+        if cur == c.s or cur == c.b or cur == c.m or cur == c.e then return true end
+      end
+    end
+    local function ahead(dir)
+      return function()
+        local cur = vim.fn.line(".")
+        for _, c in ipairs(blocks(mbuf)) do
+          if (dir > 0 and c.s > cur) or (dir < 0 and c.s < cur) then return true end
+        end
+      end
+    end
+    map("co", on_marker, function() take("o") end)
+    map("ct", on_marker, function() take("t") end)
+    map("cb", on_marker, function() take("b") end)
+    map("c0", on_marker, function() take("0") end)
+    map("cO", on_marker, function() take_all("o") end)
+    map("cT", on_marker, function() take_all("t") end)
+    map("]c", ahead(1), function() jump(1) end)
+    map("[c", ahead(-1), function() jump(-1) end)
     local o = { buffer = mbuf, nowait = true }
-    vim.keymap.set("n", "co", function() take("o") end, o)
-    vim.keymap.set("n", "ct", function() take("t") end, o)
-    vim.keymap.set("n", "cb", function() take("b") end, o)
-    vim.keymap.set("n", "c0", function() take("0") end, o)
-    vim.keymap.set("n", "cO", function() take_all("o") end, o)
-    vim.keymap.set("n", "cT", function() take_all("t") end, o)
-    vim.keymap.set("n", "]c", function() jump(1) end, o)
-    vim.keymap.set("n", "[c", function() jump(-1) end, o)
-    for _, b in ipairs({ mbuf, ours, theirs }) do vim.keymap.set("n", "q", done, { buffer = b, nowait = true }) end
+    vim.keymap.set("n", "cv", toggle, o)
+    vim.keymap.set("n", "ZZ", function() done(true) end, o)
+    vim.keymap.set("n", "ZQ", function() done(false) end, o)
     if line then vim.api.nvim_win_set_cursor(mwin, { line, 0 }) else vim.api.nvim_win_set_cursor(mwin, { 1, 0 }); jump(1) end
-  end
+    if not compact then open_sides() end
+  end)
 end
 
 local function log_view(args, name, file)
