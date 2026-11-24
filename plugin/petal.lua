@@ -5,3 +5,6 @@ vim.g.loaded_petal = true
 vim.api.nvim_create_user_command("Petal", function(o)
   if o.args == "" then require("petal").open() else require("petal").command(o.args) end
 end, { nargs = "*", desc = "Petal git status / run git" })
+
+-- :DiffOff exists before the core loads; petal.core redefines it with the real close on first use
+vim.api.nvim_create_user_command("DiffOff", function() require("petal").diff_off() end, { desc = "Close diff, back to git status" })

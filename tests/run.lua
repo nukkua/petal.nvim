@@ -27,6 +27,26 @@ local function git(args, stdin)
 end
 local function write(name, lines) vim.fn.writefile(lines, dir .. "/" .. name) end
 
+test("setup(): the core loads on first use, options set before it merge", function()
+  local script = vim.fn.tempname() .. ".lua"
+  vim.fn.writefile({
+    "vim.opt.rtp:prepend(" .. string.format("%q", vim.fn.getcwd()) .. ")",
+    "local petal = require('petal')",
+    "petal.setup({ recent = 3 })",
+    "petal.setup({ height = 5 })",
+    "print('loaded after setup: ' .. tostring(package.loaded['petal.core'] ~= nil))",
+    "local C = petal._t.config()",
+    "print('recent: ' .. C.recent .. ' height: ' .. C.height)",
+    "print('loaded after use: ' .. tostring(package.loaded['petal.core'] ~= nil))",
+  }, script)
+  local r = vim.system({ vim.v.progpath, "--clean", "--headless", "-l", script }, { text = true }):wait()
+  eq(r.code, 0, (r.stderr or "") .. (r.stdout or ""))
+  local out = (r.stdout or "") .. (r.stderr or "") -- headless print goes to stderr
+  assert(out:find("loaded after setup: false", 1, true), out)
+  assert(out:find("recent: 3 height: 5", 1, true), out)
+  assert(out:find("loaded after use: true", 1, true), out)
+end)
+
 ---------------------------------------------------------------- parsers
 
 test("parse_status", function()
@@ -179,6 +199,19 @@ test("split_diff: batched diff matches per-file diffs", function()
   by = t.split_diff(git({ "diff", "--cached", "--src-prefix=a/", "--dst-prefix=b/", "--", "new.txt", "old.txt" }))
   eq(table.concat(by["diff --git a/old.txt b/new.txt"], "\n") .. "\n", git({ "diff", "--cached", "--", "new.txt", "old.txt" }))
   git({ "reset", "-q", "--hard" })
+end)
+
+test("split_diff: parts of a whole diff that belong to no file glue onto nothing", function()
+  local by = t.split_diff(table.concat({
+    "diff --git a/a b/a", "index 1..2 100644", "--- a/a", "+++ b/a", "@@ -1 +1 @@", "-1", "+2",
+    "* Unmerged path u",
+    "diff --cc u", "index 1,2..3", "--- a/u", "+++ b/u", "@@@ -1 -1 +1 @@@", "++<<<<<<< HEAD",
+    "Submodule s 1111111..2222222:", "  > subject",
+    "diff --git a/b b/b", "index 1..2 100644", "--- a/b", "+++ b/b", "@@ -1 +1 @@", "-x", "+y",
+  }, "\n"))
+  eq(by["diff --git a/a b/a"], { "diff --git a/a b/a", "index 1..2 100644", "--- a/a", "+++ b/a", "@@ -1 +1 @@", "-1", "+2" })
+  eq(by["diff --git a/b b/b"], { "diff --git a/b b/b", "index 1..2 100644", "--- a/b", "+++ b/b", "@@ -1 +1 @@", "-x", "+y" })
+  eq(vim.tbl_count(by), 2)
 end)
 
 test("parse_merge_tree: conflicts, clean, missing ref", function()
@@ -579,6 +612,135 @@ test("refresh: an unchanged diff keeps its object and rows; a file that left its
   eq(t.S.open["untracked:a.txt"], nil, "a.txt left Untracked but is still expanded there")
   vim.cmd.cd(cwd)
   vim.fn.delete(rdir, "rf")
+end)
+
+test("refresh: a mostly-open section diffs whole (--no-renames); unmerged lines glue onto nothing", function()
+  local rdir, g = repo()
+  for i = 1, 10 do
+    vim.fn.writefile({ "a" .. i }, rdir .. "/a" .. i .. ".txt")
+    vim.fn.writefile({ "f" .. i }, rdir .. "/f" .. i .. ".txt")
+  end
+  vim.fn.writefile({ "base" }, rdir .. "/m.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "base" })
+  g({ "switch", "-qc", "other" }); vim.fn.writefile({ "theirs" }, rdir .. "/m.txt"); g({ "commit", "-qam", "theirs" })
+  g({ "switch", "-q", "main" }); vim.fn.writefile({ "ours" }, rdir .. "/m.txt"); g({ "commit", "-qam", "ours" })
+  vim.system({ "git", "merge", "other" }, { cwd = rdir }):wait() -- conflicts on m.txt, exit 1
+  local stage = { "add" }
+  for i = 1, 10 do
+    vim.fn.writefile({ "a" .. i, "x" }, rdir .. "/a" .. i .. ".txt")
+    vim.fn.writefile({ "f" .. i, "x" }, rdir .. "/f" .. i .. ".txt")
+    stage[#stage + 1] = "a" .. i .. ".txt"
+  end
+  g(stage)
+  local real, no_renames = vim.system, false
+  vim.system = function(cmd, ...)
+    if table.concat(cmd, " "):find("--no-renames", 1, true) then no_renames = true end
+    return real(cmd, ...)
+  end
+  local cwd = vim.fn.getcwd()
+  local ok, err = pcall(function()
+    vim.cmd.cd(rdir)
+    petal.open()
+    assert(vim.wait(3000, function()
+      return t.S.data and #t.S.data.st.staged == 10 and #t.S.data.st.unstaged == 11
+    end, 10), "status never rendered")
+    vim.fn.maparg("zR", "n", false, true).callback()
+    assert(vim.wait(3000, function()
+      return t.S.diffs["unstaged:f1.txt"] and t.S.diffs["staged:a1.txt"]
+    end, 10), "diffs never landed")
+    assert(no_renames, "--no-renames never used")
+    for i = 1, 10 do
+      local f, a = "f" .. i .. ".txt", "a" .. i .. ".txt"
+      local uf = t.parse_diff(vim.system({ "git", "diff", "--", f }, { cwd = rdir, text = true }):wait().stdout)
+      local sa = t.parse_diff(vim.system({ "git", "diff", "--cached", "--", a }, { cwd = rdir, text = true }):wait().stdout)
+      eq({ t.S.diffs["unstaged:" .. f].header, t.S.diffs["unstaged:" .. f].hunks }, { uf.header, uf.hunks }, f)
+      eq({ t.S.diffs["staged:" .. a].header, t.S.diffs["staged:" .. a].hunks }, { sa.header, sa.hunks }, a)
+    end
+    assert(t.S.diffs["unstaged:m.txt"].conflicts, "unmerged m.txt got no conflicts")
+  end)
+  vim.system = real
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+  assert(ok, err)
+end)
+
+test("open: rev-parse is cached per cwd; a new repo between cwd and root wins", function()
+  local rdir, g = repo()
+  vim.fn.mkdir(rdir .. "/sub", "p")
+  vim.fn.writefile({ "x" }, rdir .. "/x.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "x" })
+  local real, spawned = vim.system, 0
+  vim.system = function(cmd, ...)
+    if table.concat(cmd, " "):find("--show-toplevel", 1, true) then spawned = spawned + 1 end
+    return real(cmd, ...)
+  end
+  local cwd = vim.fn.getcwd()
+  local ok, err = pcall(function()
+    vim.cmd.cd(rdir .. "/sub")
+    petal.open()
+    assert(vim.wait(3000, function() return t.S.data end, 10), "status never rendered")
+    eq(vim.uv.fs_realpath(t.S.root), vim.uv.fs_realpath(rdir))
+    petal.open() -- same cwd: the cached answer holds
+    eq(spawned, 1, "reopen ran rev-parse")
+    vim.system({ "git", "init", "-q" }, { cwd = rdir .. "/sub" }):wait()
+    petal.open()
+    eq(vim.uv.fs_realpath(t.S.root), vim.uv.fs_realpath(rdir .. "/sub"), "inner repo not found")
+    eq(spawned, 2, "new repo below cwd did not re-run rev-parse")
+  end)
+  vim.system = real
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+  assert(ok, err)
+end)
+
+test("attrs: the attributes-file check rides the refresh batch", function()
+  local rdir, g = repo()
+  vim.fn.writefile({ "x" }, rdir .. "/x.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "x" })
+  g({ "config", "core.attributesFile", rdir .. "/no-such-attributes" }) -- the machine's global file stays out
+  local cwd = vim.fn.getcwd()
+  local ok, err = pcall(function()
+    vim.cmd.cd(rdir)
+    petal.open()
+    assert(vim.wait(3000, function() return t.S.data and t.S.attrs_check == nil end, 10), "attrs check never landed")
+    eq(t.S.attrs, false) -- no info/attributes, the configured file is missing
+    vim.fn.writefile({ "*.bin binary" }, rdir .. "/.git/info/attributes")
+    petal.open()
+    assert(vim.wait(3000, function() return t.S.attrs == true end, 10), "info/attributes not picked up")
+  end)
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+  assert(ok, err)
+end)
+
+test("refresh: a stale batch still paints when nothing is shown yet", function()
+  local rdir, g = repo()
+  vim.fn.writefile({ "x" }, rdir .. "/x.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "x" })
+  local real, batches = vim.system, 0
+  vim.system = function(cmd, o, cb) -- every refresh batch but the first answers ~1.5s late
+    if cmd[1] == "sh" and cmd[4] == "petal" and cb then
+      batches = batches + 1
+      if batches > 1 then
+        local orig = cb
+        cb = function(r) vim.defer_fn(function() orig(r) end, 1500) end
+      end
+    end
+    return real(cmd, o, cb)
+  end
+  local cwd = vim.fn.getcwd()
+  local ok, err = pcall(function()
+    vim.cmd.cd(rdir)
+    petal.open()
+    petal.refresh() -- bumps seq: the first batch lands stale, but nothing is shown yet
+    assert(vim.wait(700, function() return t.S.data ~= nil end, 10), "first paint waited for the newer batch")
+    vim.wait(2000, function() return false end, 50) -- let the delayed batches land
+    assert(vim.fn.search("Recent", "nw") > 0 or vim.fn.search("x.txt", "nw") > 0, "status not rendered")
+  end)
+  vim.system = real
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+  assert(ok, err)
 end)
 
 test("radar: merge-tree runs again only when HEAD or the target moved", function()
