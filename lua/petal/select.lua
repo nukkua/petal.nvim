@@ -10,7 +10,7 @@ function M.select(items, opts, on_choice)
   if #items == 0 then return on_choice(nil, nil) end
 
   -- format_item may return { {text, hl}, ... } chunks: joined for the qf text, colored with extmarks
-  local qf, hls = {}, {}
+  local qf, hls, texts = {}, {}, {}
   for i, it in ipairs(items) do
     local v = fmt(it)
     if type(v) == "table" then
@@ -21,18 +21,16 @@ function M.select(items, opts, on_choice)
       end
       v = text
     end
-    qf[i] = { text = v }
+    qf[i], texts[i] = { text = v }, v
   end
   -- new list (not "r") so :colder gets the previous errors back
   vim.fn.setqflist({}, " ", {
     title = opts.prompt and vim.trim(opts.prompt):gsub(":$", "") or "Select",
     items = qf,
     quickfixtextfunc = function(info)
-      local lines = {}
-      for i, it in ipairs(vim.fn.getqflist({ id = info.id, items = 1 }).items) do
-        lines[i] = it.text
-      end
-      return lines
+      local out = {}
+      for i = info.start_idx, info.end_idx do out[#out + 1] = texts[i] end
+      return out
     end,
   })
   local id = vim.fn.getqflist({ id = 0 }).id
@@ -40,19 +38,20 @@ function M.select(items, opts, on_choice)
   local buf = vim.api.nvim_get_current_buf()
   local ns = vim.api.nvim_create_namespace("petal.select")
   vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  local opt = {}
   for _, h in ipairs(hls) do
-    vim.api.nvim_buf_set_extmark(buf, ns, h[1], h[2], { end_col = h[3], hl_group = h[4] })
+    opt.end_col, opt.hl_group = h[3], h[4]
+    vim.api.nvim_buf_set_extmark(buf, ns, h[1], h[2], opt)
   end
 
-  local marked, mns = {}, vim.api.nvim_create_namespace("petal.select.mark")
-  local function draw_marks()
-    vim.api.nvim_buf_clear_namespace(buf, mns, 0, -1)
-    for i = 1, #items do
-      vim.api.nvim_buf_set_extmark(buf, mns, i - 1, 0, { virt_text_pos = "inline",
-        virt_text = { marked[i] and { "[x] ", "Special" } or { "[ ] ", "Comment" } } })
-    end
+  local marked, mns, mark_ids = {}, vim.api.nvim_create_namespace("petal.select.mark"), {}
+  vim.api.nvim_buf_clear_namespace(buf, mns, 0, -1)
+  local function draw_mark(i)
+    local mid = mark_ids[i]
+    mark_ids[i] = vim.api.nvim_buf_set_extmark(buf, mns, i - 1, 0, { id = mid, virt_text_pos = "inline",
+      virt_text = { marked[i] and { "[x] ", "Special" } or { "[ ] ", "Comment" } } })
   end
-  if opts.multi then draw_marks() end
+  if opts.multi then for i = 1, #items do draw_mark(i) end end
 
   local finished = false
   local function finish(idx)
@@ -80,7 +79,7 @@ function M.select(items, opts, on_choice)
     map("<Tab>", function()
       local l = vim.fn.line(".")
       marked[l] = not marked[l] or nil
-      draw_marks()
+      draw_mark(l)
       if l < #items then vim.cmd("normal! j") end
     end)
   end
