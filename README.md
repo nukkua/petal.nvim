@@ -1,15 +1,19 @@
 # petal.nvim
 
-Magit-style git status for Neovim, built on the git CLI. Every git call is async, and there's
-GitHub PR support through `gh`.
+Magit-style Git status for Neovim, built on the Git CLI. Status refreshes and Git actions run
+asynchronously; initial repository discovery is synchronous. GitHub PR support uses `gh`.
 
 
 ## Requirements
 
 - Neovim 0.12+
-- `git`
-- optional: [`gh`](https://cli.github.com) for pull requests
+- `git` (2.38+ for conflict previews; 2.40+ for moving hunks between commits)
+- A POSIX shell (`sh`)
+- optional: [`gh`](https://cli.github.com) for pull requests (`gh auth login`)
 - optional: [fidget.nvim](https://github.com/j-hui/fidget.nvim) for progress spinners (without it you get plain notifications)
+
+Git runs without interactive credential prompts. Set up an SSH agent or a credential helper
+before fetching or pushing.
 
 ## Install
 
@@ -23,12 +27,13 @@ vim.pack.add({ "https://github.com/nukkua/petal.nvim" })
 
 ## Setup
 
-`setup()` is optional. These are the defaults:
+`setup()` is optional. It records options without loading the core until first use.
+Options are merged shallowly: a table you pass replaces that entire option. These are the defaults:
 
 ```lua
 require("petal").setup({
   reviewers = {},                                      -- picked from when creating a PR; empty = never asks
-  base_branches = { "origin/develop", "origin/main" }, -- tried in order for "merged into", then origin/HEAD
+  base_branches = { "origin/develop", "origin/main" },  -- first existing ref; otherwise origin/HEAD, then origin/develop
   recent = 10,                                         -- commits in the Recent section
   height = 12,                                         -- height of the bottom pickers/popups
   commit_suggest = nil,                                -- agent that suggests commit messages, see below
@@ -43,15 +48,25 @@ vim.keymap.set("n", "<leader>gg", "<cmd>Petal<cr>", { desc = "Git status" })
 ## Simple mode
 
 `simple = true` keeps petal plain: the status buffer and the core keys (`c b f p P l Z`,
-`s S <c-s> u U x`, `d e`, folds, `?`, `q`). It turns off the PR line and `gh` calls, the conflict
-radar, the background fetch on open, the file watcher and the summary under the commit buffer.
-You can still bind any other action yourself, e.g. `mappings = { r = "rebase" }`.
+`s S <C-s> u U x`, `d e`, `<C-r> <CR>`, folds, `?`, `q`). It turns off the automatic PR line and
+branch-list PR badges, the conflict radar, the background fetch on open, the file watcher and
+the summary under the commit buffer. Pull and push can still fetch. You can bind any other
+action yourself, e.g. `mappings = { r = "rebase", O = "pr" }`.
 
 ## Usage
 
-- `:Petal` opens the status buffer. Press `?` inside it to list every key. Full docs: `:h petal`.
-- `:Petal <args>` runs a single git command, e.g. `:Petal log -5`.
+- `:Petal` opens the status buffer for the current directory's repository, or offers to initialize
+  one. Press `?` to list your active keys. Full docs: `:h petal`.
+- `:Petal <args>` runs `git <args>` through the shell (e.g. `:Petal log -5`); `Q` prompts for the
+  arguments. After opening Petal, commands run from the selected repository root.
+- `d` compares the working file against HEAD. `:DiffOff` returns to status without saving or
+  dropping edits; in the diff, `ZZ` saves and `ZQ` discards unsaved edits. `e` opens conflict
+  resolution on a conflicted file.
 - `D` opens the diff popup: what your branch adds vs its base (`base...HEAD`), vs any ref, or any range.
+- `b l` and `b R` list local and remote branches. Use `<CR>` to switch or edit the list and write
+  it with `:w`; remote edits are limited to deleting eligible branches with merged PRs.
+- `a` absorbs eligible staged hunks into their unpushed commits after a preview; `o` in a commit
+  view moves a hunk or file's hunks to another unpushed commit without changing HEAD's final tree.
 - `O` opens the PR popup: list (`<CR>` copies the PR URL), checkout, diff, checks (`<CR>` on a failed
   GitHub Actions job shows its failed-step log), create, open, close.
 - Creating a PR with `reviewers` set opens a quickfix picker. `<Tab>` marks one or more reviewers
@@ -61,7 +76,8 @@ You can still bind any other action yourself, e.g. `mappings = { r = "rebase" }`
 ## Mappings
 
 `mappings` maps a key to an action name (listed in `:h petal-actions`) or to `false` to remove it.
-A key you set replaces its default; the rest stay.
+A key you set replaces its default; the rest stay. Configure mappings before the first status
+buffer opens. To move an action, disable its old key as well as binding the new one.
 
 ```lua
 require("petal").setup({
@@ -73,20 +89,24 @@ require("petal").setup({
 })
 ```
 
-`:checkhealth petal` checks git, gh and its login, fidget, `commit_suggest` and `mappings`.
+`:checkhealth petal` checks the Neovim version, Git, `gh` and its login, fidget,
+`commit_suggest` and `mappings`.
 
 ## Commit message suggestions
 
-The commit buffer opens above a summary of what is being committed (staged changes, the
-worktree with `-a`, HEAD's changes when amending): each file with its +/− counts, `za` to see
-its diff.
+Outside simple mode, the commit buffer opens above a summary of the changes in the index Git
+will commit (including any temporary index Git uses). Amend compares against HEAD's parent,
+or the empty tree for the root commit. The summary shows each file's +/− counts; press `za` to
+see its diff. In the message buffer, `<C-c><C-c>` saves and closes it; `<C-c><C-k>` aborts.
 
 Set `commit_suggest` to a command that reads the diff being committed on stdin and prints a commit
-message. It starts as soon as the commit buffer opens. While the message is empty, the
+message. Petal sends the diff to that command when the commit buffer opens, if the diff isn't
+empty. Choose the command with that access in mind. While the message is empty, the
 suggestion shows as ghost text; press `<c-c><c-s>` to accept it, or `<c-c><c-y>` to accept it
-and commit right away. If you press either before the agent answers, it happens when the message
-arrives. Typing your own message hides the ghost (and `<c-c><c-y>` then refuses to overwrite it),
-and closing the buffer stops the agent. Here it is with [Claude Code](https://claude.com/claude-code):
+and commit right away. If you press either before the command answers, it takes effect when the
+message arrives if you're still in the commit buffer. Typing your own message hides the ghost:
+`<c-c><c-s>` can replace it, but `<c-c><c-y>` won't. Closing the buffer stops a running suggestion.
+Here it is with [Claude Code](https://claude.com/claude-code):
 
 ```lua
 require("petal").setup({

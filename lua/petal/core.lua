@@ -1,5 +1,5 @@
 -- petal — magit-style git status + popups on the git CLI
--- :Petal (or require("petal").open()) opens it, ? lists every key. Every git call is async (vim.system); a refresh is one
+-- :Petal (or require("petal").open()) opens it, ? lists active keys. Repo discovery and init wait for git; a refresh is one
 -- parallel batch of short processes, toggles re-render from cache, and only changed lines are redrawn.
 -- ponytail: no worktree/submodule popups; no credential prompts (use ssh-agent or a credential
 -- helper); a ' in a repo path breaks the $EDITOR bridge
@@ -8,10 +8,10 @@ local M = {}
 
 local C = {
   reviewers = {},                                      -- offered by PR create (gh); empty = never asks
-  base_branches = { "origin/develop", "origin/main" }, -- tried in order for "merged into", then origin/HEAD
+  base_branches = { "origin/develop", "origin/main" }, -- first existing ref; fallback: origin/HEAD, then origin/develop
   recent = 10,                                         -- commits in the Recent section
   height = 12,                                         -- height of the bottom pickers/popups
-  commit_suggest = nil,                                -- argv: staged diff on stdin -> commit message on stdout;
+  commit_suggest = nil,                                -- argv: diff being committed on stdin -> commit message on stdout;
                                                        -- runs when the commit buffer opens, <c-c><c-s> accepts,
                                                        -- <c-c><c-y> accepts and commits
   mappings = {},                                       -- status keys: { [key] = action name | false }, see :h petal-mappings
@@ -1783,7 +1783,7 @@ local function unstage(ctx)
   act(cat({ "restore", "--staged", "--" }, ps))
 end
 
--- nothing is lost: tracked changes go to a backup stash first, untracked files move to .git/petal-trash/
+-- tracked changes get a best-effort backup stash; untracked files move to petal-trash/ in the git dir
 local function discard(ctx)
   local it = ctx.item
   if not it or it.commit then return end
@@ -3878,7 +3878,7 @@ function M.open()
   if not C.simple then fetch_bg() end
 end
 
--- runs C.commit_suggest on the staged diff as soon as the commit buffer opens; the result shows as
+-- runs C.commit_suggest on the diff being committed, if nonempty; the result shows as
 -- ghost text while the message is empty, and the returned accept() writes it above the # comments
 -- (if still running, it is written when it arrives)
 local function suggest(buf, diff)
