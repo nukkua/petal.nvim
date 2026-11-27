@@ -737,6 +737,31 @@ test("open: rev-parse is cached per cwd; a new repo between cwd and root wins", 
   assert(ok, err)
 end)
 
+test("open: a linked worktree reuses the shared commit-graph", function()
+  local rdir, g = repo()
+  g({ "commit", "--allow-empty", "-qm", "base" })
+  g({ "worktree", "add", "-qb", "linked", "linked" })
+  g({ "commit-graph", "write", "--reachable" })
+  local real, spawned = vim.system, 0
+  vim.system = function(cmd, ...)
+    if cmd[1] == "git" and cmd[2] == "commit-graph" then spawned = spawned + 1 end
+    return real(cmd, ...)
+  end
+  local cwd = vim.fn.getcwd()
+  local ok, err = pcall(function()
+    vim.cmd.cd(rdir .. "/linked")
+    petal.open()
+    eq(vim.uv.fs_realpath(t.S.commondir), vim.uv.fs_realpath(rdir .. "/.git"))
+    petal.open()
+    eq(spawned, 0, "opening a worktree rewrote its existing shared commit-graph")
+    assert(shown("base"), "linked worktree status never rendered")
+  end)
+  vim.system = real
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+  assert(ok, err)
+end)
+
 test("attrs: the attributes-file check rides the refresh batch", function()
   local rdir, g = repo()
   vim.fn.writefile({ "x" }, rdir .. "/x.txt")

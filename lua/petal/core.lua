@@ -1504,17 +1504,7 @@ end
 -- 200k commits, 670ms vs 5ms on every refresh. Fresh clones have none until gc runs.
 -- Objects live in the common dir: a linked worktree's gitdir points there through its commondir file
 local function has_commit_graph()
-  local common = S.commondir
-  if not common then
-    local h
-    common, h = S.gitdir, io.open(S.gitdir .. "/commondir")
-    if h then
-      local c = vim.trim(h:read("*a"))
-      h:close()
-      common = c:sub(1, 1) == "/" and c or (S.gitdir .. "/" .. c)
-    end
-  end
-  local info = common .. "/objects/info/"
+  local info = S.commondir .. "/objects/info/"
   return vim.uv.fs_stat(info .. "commit-graph") ~= nil or vim.uv.fs_stat(info .. "commit-graphs/commit-graph-chain") ~= nil
 end
 
