@@ -1406,6 +1406,10 @@ test("absorb: multiple files blame in one batch and fold into their unpushed own
   vim.cmd.cd(rdir)
   petal.open()
   assert(vim.wait(3000, function() return t.S.data and #t.S.data.st.staged == 2 end, 10), "status never rendered")
+  vim.api.nvim_feedkeys("a", "x", false) -- on the Head line: does nothing
+  vim.wait(200)
+  eq(#t.S.data.st.staged, 2)
+  vim.fn.search("a.txt")
   vim.api.nvim_feedkeys("a", "x", false)
   assert(vim.wait(10000, function()
     return g({ "--no-optional-locks", "status", "--porcelain" }) == "" and g({ "log", "-2", "--format=%s" }) == "change b\nchange a\n"

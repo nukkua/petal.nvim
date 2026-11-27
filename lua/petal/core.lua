@@ -3578,6 +3578,8 @@ local function close()
 end
 
 local function with(fn) return function() fn(context()) end end
+-- header lines (Head/Merge/Push/PR) and blanks carry no item: the key does nothing there, like s
+local function on_item(fn) return function() if (S.rows[S.buf] or {})[vim.fn.line(".")] then fn() end end end
 
 local KEYS
 -- the default keys simple mode keeps; any other action can still be bound through C.mappings
@@ -3645,11 +3647,11 @@ KEYS = {
     { "S", "stage_unstaged", "Stage unstaged", function() act({ "add", "-u" }) end },
     { "u", "unstage", "Unstage", with(unstage), true }, { "U", "unstage_all", "Unstage all", unstage_all },
     { "x", "discard", "Discard", with(discard), true },
-    { "a", "absorb", "Absorb staged into unpushed commits", absorb },
+    { "a", "absorb", "Absorb staged into unpushed commits", on_item(absorb) },
     { "o", "move_hunk", "Move hunk to another commit (in a commit view)", function()
       notify("move: open a commit (<cr> on it), then o on a hunk or file", vim.log.levels.WARN)
     end },
-    { "d", "diff", "Diff mode (against HEAD)", vimdiff }, { "e", "merge_mode", "Merge mode (conflict)", merge_mode },
+    { "d", "diff", "Diff mode (against HEAD)", on_item(vimdiff) }, { "e", "merge_mode", "Merge mode (conflict)", on_item(merge_mode) },
   } },
   { "Essential commands", {
     { "<c-r>", "refresh", "Refresh", M.refresh }, { "<cr>", "goto", "Go to file", goto_item },
