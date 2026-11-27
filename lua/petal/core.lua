@@ -39,6 +39,7 @@ local S = {
   seq = 0,                           -- refresh generation: stale async results are dropped
   refreshed = 0,                     -- hrtime() of the last refresh: a watch event older than it is already shown
   watch = {},                        -- dir -> uv fs_event handle while the status is open
+  commondir = nil, reftable = false, stash_cache = nil, raw_diff = {},
 }
 local ns = vim.api.nvim_create_namespace("petal")
 local FETCH_TTL = 30000 -- ms: a fetch this fresh is reused instead of hitting the network again
@@ -88,7 +89,43 @@ local function cat(...)
   for i = 1, select("#", ...) do vim.list_extend(t, (select(i, ...))) end
   return t
 end
-local function lines(s) return vim.split(s or "", "\n", { plain = true, trimempty = true }) end
+local function lines(s)
+  if not s or s == "" then return {} end
+  local t, i, n = {}, 1, 0
+  while true do
+    local j = s:find("\n", i, true)
+    n = n + 1
+    t[n] = j and s:sub(i, j - 1) or s:sub(i)
+    if not j then break end
+    i = j + 1
+  end
+  while n > 0 and t[n] == "" do t[n], n = nil, n - 1 end
+  local first = 1
+  while first <= n and t[first] == "" do first = first + 1 end
+  if first > 1 then
+    for x = first, n do t[x - first + 1] = t[x] end
+    for x = n - first + 2, n do t[x] = nil end
+  end
+  return t
+end
+-- lines() streamed: no intermediate table, same trimempty edges and internal blank lines
+local function scan_lines(s, fn)
+  if not s or s == "" then return end
+  local i, pending, seen = 1, 0, false
+  while i <= #s do
+    local j = s:find("\n", i, true)
+    local l = j and s:sub(i, j - 1) or s:sub(i)
+    if l == "" then
+      pending = pending + 1
+    else
+      if seen then for _ = 1, pending do fn("") end end
+      seen, pending = true, 0
+      fn(l)
+    end
+    if not j then break end
+    i = j + 1
+  end
+end
 -- every message is "subject: what happened", extra lines are detail.
 -- info goes to fidget (corner, fades out); warnings/errors stay in vim.notify so they're not missed.
 -- with the builtin vim.notify they're echoed in color (icon, subject); a notifier plugin gets plain text
@@ -172,13 +209,19 @@ end
 
 -- run git (or opts.raw argv) in the repo; cb(res) on the main loop
 -- detach: no controlling tty, so ssh/https fail instead of prompting over the UI
+local BASE_ENV = { GIT_EDITOR = EDITOR, GIT_SEQUENCE_EDITOR = EDITOR, NVIM = vim.v.servername,
+  NVIM_BIN = vim.v.progpath, GIT_TERMINAL_PROMPT = "0" }
 local function git(args, opts, cb)
   opts = opts or {}
   local cmd = opts.raw or cat({ "git" }, args)
-  local env = { GIT_EDITOR = EDITOR, GIT_SEQUENCE_EDITOR = EDITOR, NVIM = vim.v.servername,
-    NVIM_BIN = vim.v.progpath, GIT_TERMINAL_PROMPT = "0" }
-  for k, v in pairs(opts.env or {}) do env[k] = v end
-  local t0 = vim.uv.hrtime()
+  local env = BASE_ENV
+  if BASE_ENV.NVIM ~= vim.v.servername then BASE_ENV.NVIM = vim.v.servername end
+  if opts.env then
+    env = {}
+    for k, v in pairs(BASE_ENV) do env[k] = v end
+    for k, v in pairs(opts.env) do env[k] = v end
+  end
+  local t0 = opts.log and vim.uv.hrtime()
   local on_exit = vim.schedule_wrap(function(r)
       if opts.log then
         table.insert(S.history, 1, { cmd = table.concat(cmd, " "), code = r.code,
@@ -205,10 +248,25 @@ end
 -- (no caller reads it). If anything goes wrong, each command falls back to its own spawn
 local BATCH_SH = [[
 d=$1; shift; i=0
-for c in "$@"; do i=$((i+1)); (eval "$c" >"$d/$i" 2>/dev/null; echo $? >"$d/$i.c") & done
+for c in "$@"; do i=$((i+1)); { eval "$c" >"$d/$i" 2>/dev/null; echo "$i $?"; } & done
 wait
 ]]
 local function shquote(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+local function slurp_uv(p)
+  local fd = vim.uv.fs_open(p, "r", 438)
+  if not fd then return nil end
+  local st = vim.uv.fs_fstat(fd)
+  if not st or st.size == 0 then vim.uv.fs_close(fd); return st and "" or nil end
+  local out, off = {}, 0
+  while off < st.size do
+    local chunk = vim.uv.fs_read(fd, st.size - off, off)
+    if not chunk or #chunk == 0 then break end
+    out[#out + 1] = chunk
+    off = off + #chunk
+  end
+  vim.uv.fs_close(fd)
+  return table.concat(out)
+end
 local function slurp(p)
   local h = io.open(p, "rb")
   if not h then return nil end
@@ -235,13 +293,19 @@ local function git_batch(cmds, cb)
     argv[#argv + 1] = table.concat(q, " ")
   end
   git(nil, { raw = argv, text = false }, function(r)
-    local res = {}
+    if r.code ~= 0 then
+      for i = 1, #cmds do vim.uv.fs_unlink(dir .. "/" .. i) end
+      vim.uv.fs_rmdir(dir)
+      return fallback()
+    end
+    local res, codes = {}, {}
+    for i, code in (r.stdout or ""):gmatch("(%d+) (%d+)") do codes[tonumber(i)] = tonumber(code) end
     for i = 1, #cmds do
-      local p = dir .. "/" .. i
-      local out, code = slurp(p), tonumber(vim.trim(slurp(p .. ".c") or ""))
-      os.remove(p)
-      os.remove(p .. ".c")
-      if r.code == 0 and out and code then res[i] = { code = code, stdout = (out:gsub("\r\n", "\n")) } end
+      local p, code = dir .. "/" .. i, codes[i]
+      local out = slurp_uv(p)
+      vim.uv.fs_unlink(p)
+      if out and out:find("\r", 1, true) then out = out:gsub("\r\n", "\n") end
+      if out and code then res[i] = { code = code, stdout = out } end
     end
     vim.uv.fs_rmdir(dir)
     local n = 0
@@ -350,9 +414,9 @@ local function fetch_bg(cb)
   end
   if vim.uv.now() - F.at < FETCH_TTL then return flush() end
   F.job = true
-  git({ "fetch", "--all", "--prune", "--quiet" }, { log = true }, function()
+  git({ "fetch", "--all", "--prune" }, { log = true }, function(r)
     F.job, F.at = false, vim.uv.now()
-    M.refresh()
+    if r.code ~= 0 or (r.stderr and r.stderr ~= "") then M.refresh() end
     flush()
   end)
 end
@@ -380,9 +444,8 @@ local function commits(ctx, cb)
 end
 
 -- `c^`, or --root when c has no parent
-local function base_of(c)
-  local r = vim.system({ "git", "rev-parse", "-q", "--verify", c .. "^" }, { cwd = S.root }):wait()
-  return r.code == 0 and c .. "^" or "--root"
+local function base_of(c, cb)
+  git({ "rev-parse", "-q", "--verify", c .. "^" }, nil, function(r) cb(r.code == 0 and c .. "^" or "--root") end)
 end
 
 ---------------------------------------------------------------- parsing
@@ -391,38 +454,51 @@ end
 local REC1, REC2, RECU = "^1" .. (" %S+"):rep(7) .. " (.*)$", "^2" .. (" %S+"):rep(8) .. " (.*)$", "^u" .. (" %S+"):rep(9) .. " (.*)$"
 local function parse_status(out)
   local st = { untracked = {}, unstaged = {}, staged = {} }
-  local recs = vim.split(out or "", "\0", { plain = true })
-  local i = 1
-  while i <= #recs do
-    local r, t = recs[i], recs[i]:sub(1, 1)
-    if t == "#" then
+  out = out or ""
+  local i, len = 1, #out
+  while i <= len do
+    local j = out:find("\0", i, true) or (len + 1)
+    local r, b = out:sub(i, j - 1), out:byte(i)
+    if b == 35 then -- #
       local k, v = r:match("^# branch%.(%S+) (.*)$")
       if k then st[k] = v end
-    elseif t == "?" then
-      table.insert(st.untracked, { section = "untracked", path = r:sub(3), mode = "?" })
-    elseif t == "1" or t == "2" then
+    elseif b == 63 then -- ?
+      st.untracked[#st.untracked + 1] = { section = "untracked", path = r:sub(3), mode = "?" }
+    elseif b == 49 or b == 50 then -- 1 2
       local x, y = r:sub(3, 3), r:sub(4, 4)
-      local path = r:match(t == "1" and REC1 or REC2)
+      local path = r:match(b == 49 and REC1 or REC2)
       local orig
-      if t == "2" then i, orig = i + 1, recs[i + 1] end
-      if x ~= "." then table.insert(st.staged, { section = "staged", path = path, mode = x, orig = orig }) end
-      if y ~= "." then table.insert(st.unstaged, { section = "unstaged", path = path, mode = y }) end
-    elseif t == "u" then
-      table.insert(st.unstaged, { section = "unstaged", path = r:match(RECU), mode = "U" })
+      if b == 50 and j < len then
+        local q = out:find("\0", j + 1, true) or (len + 1)
+        orig, j = out:sub(j + 1, q - 1), q
+      end
+      if x ~= "." then st.staged[#st.staged + 1] = { section = "staged", path = path, mode = x, orig = orig } end
+      if y ~= "." then st.unstaged[#st.unstaged + 1] = { section = "unstaged", path = path, mode = y } end
+    elseif b == 117 then -- u
+      st.unstaged[#st.unstaged + 1] = { section = "unstaged", path = r:match(RECU), mode = "U" }
     end
-    i = i + 1
+    i = j + 1
   end
   return st
 end
 
 -- one row per line of `git log [--graph] --format=LOGFMT`; graph-only connector lines have no hash
 local function parse_log(out, marked)
-  local t = {}
-  for _, l in ipairs(lines(out)) do
-    local m
-    if marked then m, l = l:sub(1, 1), l:sub(2) end
-    local g, h, refs_, subj, an, ar = l:match("^(.-)(%x+)\31(.-)\31(.-)\31(.-)\31(.*)$")
-    t[#t + 1] = h and { graph = g, hash = h, refs = refs_, subject = subj, author = an, date = ar, mark = m } or { graph = l }
+  local t, n = {}, 0
+  out = out or ""
+  local i = 1
+  while i <= #out do
+    local j = out:find("\n", i, true)
+    local l = j and out:sub(i, j - 1) or out:sub(i)
+    if l ~= "" then
+      local m
+      if marked then m, l = l:sub(1, 1), l:sub(2) end
+      local g, h, refs_, subj, an, ar = l:match("^(.-)(%x+)\31(.-)\31(.-)\31(.-)\31(.*)$")
+      n = n + 1
+      t[n] = h and { graph = g, hash = h, refs = refs_, subject = subj, author = an, date = ar, mark = m } or { graph = l }
+    end
+    if not j then break end
+    i = j + 1
   end
   return t
 end
@@ -435,31 +511,47 @@ end
 -- out: git's output, or its lines already split (and trimmed, as lines() does)
 local function parse_diff(out)
   local d, h = { header = {}, hunks = {} }, nil
-  for _, l in ipairs(type(out) == "table" and out or lines(out)) do
-    if l:sub(1, 2) == "@@" then
+  local hn, dn = 0, 0
+  local function line(l)
+    if l:byte(1) == 64 and l:byte(2) == 64 then
       h = { header = l, lines = {}, new = tonumber(l:match("%+(%d+)")) or 1 }
-      table.insert(d.hunks, h)
+      dn = dn + 1
+      d.hunks[dn] = h
+      hn = 0
     elseif h then
-      table.insert(h.lines, l)
+      hn = hn + 1
+      h.lines[hn] = l
     else
-      table.insert(d.header, l)
+      d.header[#d.header + 1] = l
     end
+  end
+  if type(out) == "table" then
+    for i = 1, #out do line(out[i]) end
+  else
+    scan_lines(out, line)
   end
   return d
 end
 
 -- conflict blocks read straight from the markers in the worktree file (|||||| base part is optional)
 local function parse_conflicts(path)
-  local out, cur, part, n = {}, nil, nil, 0
-  local ok, it = pcall(io.lines, path)
-  if not ok then return out end
-  for l in it do
+  local data = slurp_uv(path) or slurp(path)
+  local out = {}
+  if not data or not data:find("<<<<<<<", 1, true) then return out end
+  local cur, part, n = nil, nil, 0
+  local i, len = 1, #data
+  while i <= len do
+    local j = data:find("\n", i, true)
+    local l = j and data:sub(i, j - 1) or data:sub(i)
     n = n + 1
-    if l:match("^<<<<<<<") then cur, part = { line = n, ours = {}, base = {}, theirs = {} }, "ours"
-    elseif cur and l:match("^|||||||") then part = "base"
-    elseif cur and l:match("^=======$") then part = "theirs"
-    elseif cur and l:match("^>>>>>>>") then out[#out + 1], cur = cur, nil
-    elseif cur then table.insert(cur[part], l) end
+    local b = l:byte(1)
+    if b == 60 and l:match("^<<<<<<<") then cur, part = { line = n, ours = {}, base = {}, theirs = {} }, "ours"
+    elseif cur and b == 124 and l:match("^|||||||") then part = "base"
+    elseif cur and b == 61 and l:match("^=======$") then part = "theirs"
+    elseif cur and b == 62 and l:match("^>>>>>>>") then out[#out + 1], cur = cur, nil
+    elseif cur then cur[part][#cur[part] + 1] = l end
+    if not j then break end
+    i = j + 1
   end
   return out
 end
@@ -474,11 +566,42 @@ end
 -- emits two sections with the same header; they concatenate, as a per-file diff would)
 local function split_diff(out)
   local by, cur = {}, nil
-  for _, l in ipairs(lines(out)) do
-    if l:sub(1, 11) == "diff --git " then cur = l; by[cur] = by[cur] or {}
+  scan_lines(out, function(l)
+    local b = l:byte(1)
+    if b == 100 and l:sub(1, 11) == "diff --git " then cur = l; by[cur] = by[cur] or {}
     -- no file's part: a combined diff (unmerged), "* Unmerged path x", diff.submodule=log's summary
-    elseif cur and (l:sub(1, 5) == "diff " or l:sub(1, 16) == "* Unmerged path " or l:sub(1, 10) == "Submodule ") then cur = nil end
-    if cur then table.insert(by[cur], l) end
+    elseif cur and ((b == 100 and l:sub(1, 5) == "diff ") or (b == 42 and l:sub(1, 16) == "* Unmerged path ") or (b == 83 and l:sub(1, 10) == "Submodule ")) then cur = nil end
+    if cur then by[cur][#by[cur] + 1] = l end
+  end)
+  return by
+end
+
+-- raw halves of split_diff: no line table per diff line, so unchanged multi-MB diffs compare as one string
+local function split_diff_raw(out)
+  local by = {}
+  out = out or ""
+  local pos
+  if out:sub(1, 11) == "diff --git " then
+    pos = 1
+  else
+    local q = out:find("\ndiff --git ", 1, true)
+    pos = q and q + 1 or nil
+  end
+  local nu = out:find("\n* Unmerged path ", 1, true)
+  local ns_ = out:find("\nSubmodule ", 1, true)
+  while pos do
+    local line_end = out:find("\n", pos, true) or (#out + 1)
+    local header = out:sub(pos, line_end - 1)
+    while nu and nu < line_end do nu = out:find("\n* Unmerged path ", nu + 1, true) end
+    while ns_ and ns_ < line_end do ns_ = out:find("\nSubmodule ", ns_ + 1, true) end
+    local stop = out:find("\ndiff ", line_end, true)
+    if nu and (not stop or nu < stop) then stop = nu end
+    if ns_ and (not stop or ns_ < stop) then stop = ns_ end
+    local raw = out:sub(pos, (stop or (#out + 1)) - 1)
+    while raw:byte(-1) == 10 do raw = raw:sub(1, -2) end
+    by[header] = by[header] and (by[header] .. "\n" .. raw) or raw
+    local q = out:find("\ndiff --git ", stop or line_end, true)
+    pos = q and q + 1 or nil
   end
   return by
 end
@@ -516,10 +639,22 @@ local function untracked_read(f, full, st)
   if st.type == "link" then
     data, mode = vim.uv.fs_readlink(full), "120000"
   elseif st.type == "file" then
-    local h = io.open(full, "rb")
-    if not h then return { header = {}, hunks = {} } end
-    data, mode = h:read("*a"), bit.band(st.mode, 64) ~= 0 and "100755" or "100644"
-    h:close()
+    local fd = vim.uv.fs_open(full, "r", 438)
+    if not fd then return { header = {}, hunks = {} } end
+    if st.size == 0 then
+      data = ""
+    else
+      local parts, off = {}, 0
+      while off < st.size do
+        local chunk = vim.uv.fs_read(fd, st.size - off, off)
+        if not chunk or #chunk == 0 then break end
+        parts[#parts + 1] = chunk
+        off = off + #chunk
+      end
+      data = table.concat(parts)
+    end
+    vim.uv.fs_close(fd)
+    mode = bit.band(st.mode, 64) ~= 0 and "100755" or "100644"
   end
   if not data then return nil end
   local header = { "diff --git a/" .. f.path .. " b/" .. f.path, "new file mode " .. mode }
@@ -530,10 +665,18 @@ local function untracked_read(f, full, st)
   end
   -- git ends a name with a space in a tab, so patch tools know where it stops
   vim.list_extend(header, { "--- /dev/null", "+++ b/" .. f.path .. (f.path:find(" ", 1, true) and "\t" or "") })
-  data = data:gsub("\r\n", "\n") -- as vim.system's text mode does to git's output
+  if data:find("\r", 1, true) then data = data:gsub("\r\n", "\n") end -- as vim.system's text mode does to git's output
   local nl = data:sub(-1) == "\n"
-  local ls = vim.split(nl and data:sub(1, -2) or data, "\n", { plain = true })
-  for i, l in ipairs(ls) do ls[i] = "+" .. l end
+  local ls, n, i = {}, 0, 1
+  local last = nl and #data - 1 or #data
+  while i <= last + 1 do
+    local j = data:find("\n", i, true)
+    j = j and j <= last and j or nil
+    n = n + 1
+    ls[n] = "+" .. data:sub(i, j and j - 1 or last)
+    if not j then break end
+    i = j + 1
+  end
   if not nl then ls[#ls + 1] = "\\ No newline at end of file" end
   local n = #ls - (nl and 0 or 1)
   return { header = header, hunks = { { header = n == 1 and "@@ -0,0 +1 @@" or ("@@ -0,0 +1," .. n .. " @@"), lines = ls, new = 1 } } }
@@ -609,35 +752,120 @@ local MODE_HL = { M = "GitChangeModified", A = "GitChangeNewFile", D = "GitChang
   R = "GitChangeRenamed", C = "GitChangeCopied", T = "GitChangeUpdated", U = "GitChangeUnmerged" }
 local BUSY = { { "rebase", "rebase" }, { "merge", "merge" }, { "pick", "cherry-pick" }, { "revert", "revert" }, { "bisect", "bisect" } }
 
+-- one file's expanded diff as shareable line/highlight arrays plus one span per hunk. Rows in SH are
+-- relative to the block start; spans resolve a row to its item lazily, so big diffs allocate no R row tables
+local function diff_seg(hunks)
+  local SL, SH, spans = {}, {}, {}
+  local shn = 0
+  for hi, h in ipairs(hunks or {}) do
+    local off = #SL + 1
+    spans[#spans + 1] = { off = off, len = 1 + #h.lines, hunk = h, hi = hi }
+    local n = #SL
+    if #h.header > 0 then
+      SH[shn + 1], SH[shn + 2], SH[shn + 3] = n, #h.header, "GitHunkHeader"
+      shn = shn + 3
+    end
+    SL[n + 1] = h.header
+    for i, l in ipairs(h.lines) do
+      -- hot loop (one per diff line): no chunk tables and no sub() string
+      local c = l:byte(1)
+      n = #SL
+      local g = c == 43 and "GitDiffAdd" or c == 45 and "GitDiffDelete" or nil -- + -
+      if g then
+        SH[shn + 1], SH[shn + 2], SH[shn + 3] = n, #l, g
+        shn = shn + 3
+      end
+      SL[n + 1] = l
+    end
+  end
+  return SL, SH, spans
+end
+
+-- diff rows are missing from R until asked: __index maps a 1-based line through the file span, then the hunk span
+local function attach_spans(R, file_spans, make_item)
+  return setmetatable(R, { __index = function(_, lnum)
+    if type(lnum) ~= "number" then return nil end
+    local lo, hi, fs = 1, #file_spans, nil
+    while lo <= hi do
+      local mid = math.floor((lo + hi) / 2)
+      local x = file_spans[mid]
+      if lnum < x.s then hi = mid - 1
+      elseif lnum > x.e then lo = mid + 1
+      else fs = x break end
+    end
+    if not fs then return nil end
+    local rel = lnum - fs.s + 1
+    local spans = fs.spans
+    lo, hi = 1, #spans
+    local hs
+    while lo <= hi do
+      local mid = math.floor((lo + hi) / 2)
+      local x = spans[mid]
+      if rel < x.off then hi = mid - 1
+      elseif rel >= x.off + x.len then lo = mid + 1
+      else hs = x break end
+    end
+    return hs and make_item(fs, hs, rel - hs.off) or nil
+  end })
+end
+
 -- write lines/highlights to buf, touching only the lines that changed (keeps the cursor and is cheap)
 local function paint(buf, L, H)
+  local clear_ns, set_extmark = vim.api.nvim_buf_clear_namespace, vim.api.nvim_buf_set_extmark
   local old = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local p, s = 0, 0
   while p < #old and p < #L and old[p + 1] == L[p + 1] do p = p + 1 end
   while s < #old - p and s < #L - p and old[#old - s] == L[#L - s] do s = s + 1 end
   if p == #old and p == #L then return end -- identical: keep lines and highlights
+  local old_n, new_n, full = #old, #L, p == 0 and s == 0
   -- drop the replaced lines' marks first: deleted lines would pile them onto row p, and moving then
   -- clearing 50k of those (collapsing a big diff) was ~40ms
-  vim.api.nvim_buf_clear_namespace(buf, ns, p, #old - s)
+  if full then clear_ns(buf, ns, 0, -1) elseif p < old_n - s then clear_ns(buf, ns, p, old_n - s) end
   vim.bo[buf].modifiable = true
-  vim.api.nvim_buf_set_lines(buf, p, #old - s, false, vim.list_slice(L, p + 1, #L - s))
+  local slice = full and L or (p + 1 > new_n - s and {} or vim.list_slice(L, p + 1, new_n - s))
+  vim.api.nvim_buf_set_lines(buf, p, old_n - s, false, slice)
   vim.bo[buf].modifiable = false
   -- unchanged lines keep their extmarks (they move with the text); marks of replaced lines collapse
   -- onto row p, so the redone range always includes it
-  local e = math.max(#L - s, p + 1)
-  vim.api.nvim_buf_clear_namespace(buf, ns, p, e)
-  for _, h in ipairs(H) do -- H is in row order
+  local e = full and new_n or math.max(new_n - s, p + 1)
+  if not full then clear_ns(buf, ns, p, e) end
+  local opt = {}
+  local first = 1
+  if p > 0 then -- H is in row order: skip everything ending above the replaced range
+    local lo, hi = 1, #H
+    while lo <= hi do
+      local mid = math.floor((lo + hi) / 2)
+      local hm = H[mid]
+      if (hm.seg and hm[1] + hm.n or hm[1] + 1) > p then hi = mid - 1 else lo = mid + 1 end
+    end
+    first = lo
+  end
+  for x = first, #H do
+    local h = H[x]
     if h[1] >= e then break end
-    if h.seg then -- a cached diff block (render): its marks, rows relative to h[1]; skipped whole when above p
-      if h[1] + h.n > p then
-        for _, x in ipairs(h.seg) do
-          local row = h[1] + x[1]
+    if h.seg then -- a cached diff block: flat marks, rows relative to h[1]; skipped whole when above p
+      local base, seg = h[1], h.seg
+      if base + h.n > p then
+        local start = 1
+        if p > base then
+          local want = p - base
+          local lo, a, b = #seg / 3 + 1, 1, #seg / 3
+          while a <= b do
+            local mid = math.floor((a + b) / 2)
+            if seg[mid * 3 - 2] >= want then lo, b = mid, mid - 1 else a = mid + 1 end
+          end
+          start = lo <= #seg / 3 and (lo * 3 - 2) or (#seg + 1)
+        end
+        for i = start, #seg, 3 do
+          local row = base + seg[i]
           if row >= e then break end
-          if row >= p then vim.api.nvim_buf_set_extmark(buf, ns, row, x[2], { end_col = x[3], hl_group = x[4] }) end
+          opt.end_col, opt.hl_group = seg[i + 1], seg[i + 2]
+          set_extmark(buf, ns, row, 0, opt)
         end
       end
     elseif h[1] >= p then
-      vim.api.nvim_buf_set_extmark(buf, ns, h[1], h[2], { end_col = h[3], hl_group = h[4] })
+      opt.end_col, opt.hl_group = h[3], h[4]
+      set_extmark(buf, ns, h[1], h[2], opt)
     end
   end
 end
@@ -646,7 +874,15 @@ end
 local function builder()
   local L, H, R = {}, {}, {}
   local function add(chunks, item)
-    local t, col = {}, 0
+    local col = 0
+    if #chunks == 1 then
+      local c, row = chunks[1], #L
+      L[row + 1] = c[1]
+      if c[2] and #c[1] > 0 then H[#H + 1] = { row, 0, #c[1], c[2] } end
+      R[row + 1] = item
+      return
+    end
+    local t = {}
     for _, c in ipairs(chunks) do
       t[#t + 1] = c[1]
       if c[2] and #c[1] > 0 then H[#H + 1] = { #L, col, col + #c[1], c[2] } end
@@ -676,9 +912,11 @@ local function refchunks(refs_, ch, set)
 end
 
 -- unix time -> "now", "20m", "3h", "2d", "5w", "4mo", "2y"
-local function age(t)
-  local d = os.time() - (tonumber(tostring(t or ""):match("(%d+)}?$")) or os.time())
-  for _, u in ipairs({ { 31536000, "y" }, { 2592000, "mo" }, { 604800, "w" }, { 86400, "d" }, { 3600, "h" }, { 60, "m" } }) do
+local AGE_UNITS = { { 31536000, "y" }, { 2592000, "mo" }, { 604800, "w" }, { 86400, "d" }, { 3600, "h" }, { 60, "m" } }
+local function age(t, now)
+  now = now or os.time()
+  local d = now - (tonumber(t) or tonumber(tostring(t or ""):match("(%d+)}?$")) or now)
+  for _, u in ipairs(AGE_UNITS) do
     if d >= u[1] then return math.floor(d / u[1]) .. u[2] end
   end
   return "now"
@@ -690,7 +928,12 @@ local function text_width(win)
   return info and (info.width - info.textoff) or vim.o.columns
 end
 
+local function strwidth(s) return not s:find("[^\32-\126]") and #s or vim.api.nvim_strwidth(s) end
 local function cut(str, n)
+  if not str:find("[^\32-\126]") then
+    if #str <= n then return str end
+    return n < 1 and "" or (str:sub(1, n - 1) .. "…")
+  end
   if vim.api.nvim_strwidth(str) <= n then return str end
   if n < 1 then return "" end
   local s = vim.fn.strcharpart(str, 0, n - 1)
@@ -737,24 +980,43 @@ end
 
 -- graph columns cycle GitGraph1..6 so parallel branches stay apart; author/age form one aligned column
 -- and subjects are cut with … so a row never wraps in `avail` columns
+local GRAPH_HL = { "GitGraph1", "GitGraph2", "GitGraph3", "GitGraph4", "GitGraph5", "GitGraph6" }
 local function add_commits(add, list, set, k, avail)
   local rows, w, rw, kw, aw = {}, 0, 0, 0, 0
+  local now = os.time()
   for _, c in ipairs(list) do
     if c.hash and not c.detail then c.kind, c.detail = kind_of(c.subject) end
     kw = math.max(kw, #(c.kind or ""))
-    aw = math.max(aw, vim.api.nvim_strwidth(c.author or ""))
+    aw = math.max(aw, strwidth(c.author or ""))
   end
   aw = math.min(aw, 16) -- one long name must not widen every row and squeeze the subjects
   for i, c in ipairs(list) do
-    local ch, g = {}, c.graph or ""
-    for j = 1, #g do
+    local ch, g, pw = {}, c.graph or "", 0
+    local function ap(x, hl)
+      ch[#ch + 1] = { x, hl }
+      pw = pw + strwidth(x)
+    end
+    local j = 1
+    while j <= #g do
       local x = g:sub(j, j)
-      ch[#ch + 1] = { x, x == "*" and "GitGraphCommit" or x ~= " " and ("GitGraph" .. (math.floor((j - 1) / 2) % 6 + 1)) or nil }
+      if x == " " then
+        local q = j
+        while q <= #g and g:sub(q, q) == " " do q = q + 1 end
+        ap(g:sub(j, q - 1))
+        j = q
+      else
+        ap(x, x == "*" and "GitGraphCommit" or GRAPH_HL[math.floor((j - 1) / 2) % 6 + 1])
+        j = j + 1
+      end
     end
     local right
     if c.hash then
-      vim.list_extend(ch, { { c.hash, "GitObjectId" }, { " " } })
-      if kw > 0 then vim.list_extend(ch, { { ("%-" .. kw .. "s"):format(c.kind or ""), kind_hl(c.kind) }, { " " } }) end
+      ap(c.hash, "GitObjectId")
+      ap(" ")
+      if kw > 0 then
+        ap(("%-" .. kw .. "s"):format(c.kind or ""), kind_hl(c.kind))
+        ap(" ")
+      end
       -- refs in git's own (…) so they never read as part of the message
       local rc = {}
       refchunks(c.refs, rc, set)
@@ -765,32 +1027,34 @@ local function add_commits(add, list, set, k, avail)
         for _, x in ipairs(rc) do
           if left <= 0 then break end
           local t = cut(x[1], left)
-          kept[#kept + 1], left = { t, x[2] }, left - vim.api.nvim_strwidth(t)
+          kept[#kept + 1], left = { t, x[2] }, left - strwidth(t)
           if t ~= x[1] then break end
         end
         if kept[#kept][1] == " " then kept[#kept] = nil end
         rc = kept
-        vim.list_extend(ch, { { "(", "GitSubtleText" } })
-        vim.list_extend(ch, rc)
-        ch[#ch + 1] = { ") ", "GitSubtleText" }
+        ap("(", "GitSubtleText")
+        for _, x in ipairs(rc) do ap(x[1], x[2]) end
+        ap(") ", "GitSubtleText")
       end
       right = (aw > 0 and (" "):rep(aw + 1) or "") .. "   "
       rw = math.max(rw, #right)
     end
-    local pw = 0
-    for _, x in ipairs(ch) do pw = pw + vim.api.nvim_strwidth(x[1]) end
     rows[i] = { ch, pw, right }
-    if c.hash then w = math.max(w, pw + vim.api.nvim_strwidth(c.detail)) end
+    if c.hash then w = math.max(w, pw + strwidth(c.detail)) end
   end
   w = math.min(w, 90, (avail or vim.o.columns) - rw - 2) -- column for author/age; never pushed off screen
   for i, c in ipairs(list) do
-    local ch, pw, right = rows[i][1], rows[i][2], rows[i][3]
+    local ch, pw = rows[i][1], rows[i][2]
     if c.hash then
       local subj = cut(c.detail, w - pw)
-      vim.list_extend(ch, { { subj }, { (" "):rep(math.max(w - pw - vim.api.nvim_strwidth(subj), 0) + 2) } })
+      ch[#ch + 1] = { subj }
+      ch[#ch + 1] = { (" "):rep(math.max(w - pw - strwidth(subj), 0) + 2) }
       local a = cut(c.author or "", aw)
-      if aw > 0 then vim.list_extend(ch, { { a, "GitGraphAuthor" }, { (" "):rep(aw - vim.api.nvim_strwidth(a) + 1) } }) end
-      ch[#ch + 1] = { ("%3s"):format(age(c.date)), "GitSubtleText" }
+      if aw > 0 then
+        ch[#ch + 1] = { a, "GitGraphAuthor" }
+        ch[#ch + 1] = { (" "):rep(aw - strwidth(a) + 1) }
+      end
+      ch[#ch + 1] = { ("%3s"):format(age(c.date, now)), "GitSubtleText" }
     end
     add(ch, c.hash and { section = k, commit = c.hash } or nil)
   end
@@ -824,6 +1088,8 @@ local function render(focus)
   local cur = win ~= -1 and vim.api.nvim_win_get_cursor(win)[1] or 1
   local want = focus or key((S.rows[buf] or {})[cur])
   local add, L, H, R = builder()
+  local R_spans = {}
+  local width = text_width(win)
   local st, sub = d.st, "GitSubtleText"
 
   local head = st.head == "(detached)" and (st.oid or ""):sub(1, 7) or (st.head or "?")
@@ -907,30 +1173,18 @@ local function render(focus)
     -- allocating two tables per line again
     local seg = diff.seg
     if not (seg and seg.f == f) then
-      seg = { f = f, L = {}, H = {}, R = {} }
-      local SL, SH, SR = seg.L, seg.H, seg.R
-      for hi, h in ipairs(diff.hunks or {}) do
-        local n = #SL
-        if #h.header > 0 then SH[#SH + 1] = { n, 0, #h.header, "GitHunkHeader" } end
-        SL[n + 1], SR[n + 1] = h.header, { section = f.section, file = f, diff = diff, hunk = h, hi = hi, idx = 0 }
-        for i, l in ipairs(h.lines) do
-          -- hot loop (one per diff line): no chunk tables and no sub() string
-          local c = l:byte(1)
-          n = #SL
-          local g = c == 43 and "GitDiffAdd" or c == 45 and "GitDiffDelete" or nil -- + -
-          if g then SH[#SH + 1] = { n, 0, #l, g } end
-          SL[n + 1], SR[n + 1] = l, { section = f.section, file = f, diff = diff, hunk = h, hi = hi, idx = i }
-        end
-      end
+      local SL, SH, spans = diff_seg(diff.hunks)
+      seg = { f = f, L = SL, H = SH, spans = spans }
       diff.seg = seg
     end
     local n = #L
-    for i, l in ipairs(seg.L) do L[n + i], R[n + i] = l, seg.R[i] end
+    for i, l in ipairs(seg.L) do L[n + i] = l end
+    if #seg.L > 0 then R_spans[#R_spans + 1] = { s = n + 1, e = n + #seg.L, f = f, diff = diff, spans = seg.spans } end
     if #seg.H > 0 then H[#H + 1] = { n, seg = seg.H, n = #seg.L } end
   end
 
   local function files(list) for _, f in ipairs(list) do file(f) end end
-  local function commits(list, k) add_commits(add, list, d.remoteset, k, text_width(win)) end
+  local function commits(list, k) add_commits(add, list, d.remoteset, k, width) end
   section("untracked", "Untracked files", st.untracked, files)
   section("unstaged", "Unstaged changes", st.unstaged, files)
   section("staged", "Staged changes", st.staged, files)
@@ -941,12 +1195,30 @@ local function render(focus)
   end)
   section("recent", "Recent commits", d.recent, commits, commit_count(d.recent))
 
+  if #R_spans > 0 then
+    attach_spans(R, R_spans, function(fs, hs, idx)
+      return { section = fs.f.section, file = fs.f, diff = fs.diff, hunk = hs.hunk, hi = hs.hi, idx = idx }
+    end)
+  end
   paint(buf, L, H)
   S.rows[buf] = R
   if win ~= -1 then
     local row = math.min(cur, #L)
-    if key(R[row]) ~= want then -- usually the item hasn't moved: skip a key() per row
+    if want and key(R[row]) ~= want then -- usually the item hasn't moved: skip a key() per row
       for r, it in pairs(R) do if key(it) == want then row = r break end end
+      if key(R[row]) ~= want and #R_spans > 0 then
+        local fk, hi, idx = want:match("^(.*):(%d+):(%d+)$")
+        if fk then
+          hi, idx = tonumber(hi), tonumber(idx)
+          for _, fs in ipairs(R_spans) do
+            if fkey(fs.f) == fk then
+              local hs = fs.spans[hi]
+              if hs and idx < hs.len then row = fs.s + hs.off - 1 + idx end
+              break
+            end
+          end
+        end
+      end
     end
     vim.api.nvim_win_set_cursor(win, { row, 0 })
   end
@@ -1231,15 +1503,21 @@ end
 -- 200k commits, 670ms vs 5ms on every refresh. Fresh clones have none until gc runs.
 -- Objects live in the common dir: a linked worktree's gitdir points there through its commondir file
 local function has_commit_graph()
-  local common, h = S.gitdir, io.open(S.gitdir .. "/commondir")
-  if h then
-    local c = vim.trim(h:read("*a"))
-    h:close()
-    common = c:sub(1, 1) == "/" and c or (S.gitdir .. "/" .. c)
+  local common = S.commondir
+  if not common then
+    local h
+    common, h = S.gitdir, io.open(S.gitdir .. "/commondir")
+    if h then
+      local c = vim.trim(h:read("*a"))
+      h:close()
+      common = c:sub(1, 1) == "/" and c or (S.gitdir .. "/" .. c)
+    end
   end
   local info = common .. "/objects/info/"
   return vim.uv.fs_stat(info .. "commit-graph") ~= nil or vim.uv.fs_stat(info .. "commit-graphs/commit-graph-chain") ~= nil
 end
+
+local RAW = setmetatable({}, { __mode = "k" }) -- parsed diff -> the exact raw diff it came from
 
 -- `git diff -- <paths>` matches every path against every index entry: 300 open files of a 30k-file
 -- repo took 121ms, the whole diff 40ms. With most of a section open (zR) diff all of it and keep the
@@ -1278,13 +1556,30 @@ function M.refresh()
   end
   step({ "rev-parse", "--abbrev-ref", "@{push}" }, function(r) d.push = ok(r) end)
   step({ "show", "-s", "--format=%s", "@{push}" }, function(r) d.push_subject = ok(r) end)
-  step({ "stash", "list", "--format=%gd%x1f%gs" }, function(r)
-    d.stashes = {}
-    for _, l in ipairs(lines(r.stdout)) do
-      local ref, subj = l:match("^(.-)\31(.*)$")
-      if ref then d.stashes[#d.stashes + 1] = { ref = ref, subject = subj } end
+  local stash_step, stash_stamp = true, nil
+  if not S.reftable and S.commondir then
+    local logst = vim.uv.fs_stat(S.commondir .. "/logs/refs/stash")
+    if not logst then
+      d.stashes, stash_step = {}, false
+    else
+      local refst = vim.uv.fs_stat(S.commondir .. "/refs/stash") or vim.uv.fs_stat(S.commondir .. "/packed-refs")
+      local function stamp(x) return x and (x.size .. ":" .. x.mtime.sec .. ":" .. x.mtime.nsec .. ":" .. x.ino) or "-" end
+      stash_stamp = stamp(logst) .. "/" .. stamp(refst)
+      if S.stash_cache and S.stash_cache.stamp == stash_stamp then
+        d.stashes, stash_step = S.stash_cache.list, false
+      end
     end
-  end)
+  end
+  if stash_step then
+    step({ "stash", "list", "--format=%gd%x1f%gs" }, function(r)
+      d.stashes = {}
+      for _, l in ipairs(lines(r.stdout)) do
+        local ref, subj = l:match("^(.-)\31(.*)$")
+        if ref then d.stashes[#d.stashes + 1] = { ref = ref, subject = subj } end
+      end
+      if stash_stamp then S.stash_cache = { stamp = stash_stamp, list = d.stashes } end
+    end)
+  end
   step({ "remote", "-v" }, function(r)
     d.remotes, d.remoteset, d.owners = {}, {}, {}
     for _, l in ipairs(lines(r.stdout)) do
@@ -1320,7 +1615,16 @@ function M.refresh()
     elseif batch[f.section] and batchable(f) then
       table.insert(batch[f.section], { k, f })
     else
-      step(diff_args(f), function(r) diffs[k] = keep(k, parse_diff(r.stdout)) end)
+      step(diff_args(f), function(r)
+        local old = S.diffs[k]
+        if old and RAW[old] == r.stdout then
+          diffs[k] = old
+        else
+          local parsed = keep(k, parse_diff(r.stdout))
+          RAW[parsed] = r.stdout
+          diffs[k] = parsed
+        end
+      end)
     end
   end
   for sec, fs in pairs(batch) do
@@ -1329,12 +1633,34 @@ function M.refresh()
       local args = cat({ "-c", "core.quotePath=false", "diff", "--src-prefix=a/", "--dst-prefix=b/" },
         sec == "staged" and { "--cached" } or {}, whole and { "--no-renames" } or { "--" })
       if not whole then for _, e in ipairs(fs) do vim.list_extend(args, { e[2].path, e[2].orig }) end end
+      local keys = {}
+      for i, e in ipairs(fs) do keys[i] = e[1] end
+      local sig = table.concat(keys, "\0")
       step(args, function(r)
-        local by = split_diff(r.stdout)
+        local prev = S.raw_diff[sec]
+        if prev and prev.raw == r.stdout and prev.sig == sig then
+          local fresh = true
+          for _, e in ipairs(fs) do
+            local old = S.diffs[e[1]]
+            if not (old and RAW[old]) then fresh = false break end
+          end
+          if fresh then
+            for _, e in ipairs(fs) do diffs[e[1]] = S.diffs[e[1]] end
+            return
+          end
+        end
+        S.raw_diff[sec] = { raw = r.stdout, sig = sig }
+        local by = split_diff_raw(r.stdout)
         for _, e in ipairs(fs) do
-          local ls = by[diff_header(e[2])] or {}
-          while ls[#ls] == "" do ls[#ls] = nil end -- what lines() trimmed when this was re-joined and split
-          diffs[e[1]] = keep(e[1], parse_diff(ls))
+          local raw = by[diff_header(e[2])] or ""
+          local old = S.diffs[e[1]]
+          if old and RAW[old] == raw then
+            diffs[e[1]] = old
+          else
+            local parsed = keep(e[1], parse_diff(raw))
+            RAW[parsed] = raw
+            diffs[e[1]] = parsed
+          end
         end
       end)
     end
@@ -1504,26 +1830,27 @@ end
 -- multi-file patch -> { path, orig, mode, header, hunks, add, del, binary }
 local function parse_files(out)
   local files, cur, h = {}, nil, nil
-  for _, l in ipairs(lines(out)) do
-    local a, b = l:match("^diff %-%-git a/(.-) b/(.+)$")
+  scan_lines(out, function(l)
+    local b = l:byte(1)
+    local a, bb
+    if b == 100 then a, bb = l:match("^diff %-%-git a/(.-) b/(.+)$") end
     if a then
-      cur, h = { path = b, orig = a ~= b and a or nil, mode = "M", header = { l }, hunks = {}, add = 0, del = 0 }, nil
+      cur, h = { path = bb, orig = a ~= bb and a or nil, mode = "M", header = { l }, hunks = {}, add = 0, del = 0 }, nil
       files[#files + 1] = cur
-    elseif cur and l:sub(1, 2) == "@@" then
+    elseif cur and b == 64 and l:byte(2) == 64 then
       h = { header = l, lines = {}, new = tonumber(l:match("%+(%d+)")) or 1 }
       cur.hunks[#cur.hunks + 1] = h
     elseif h then
       h.lines[#h.lines + 1] = l
-      local c = l:sub(1, 1)
-      if c == "+" then cur.add = cur.add + 1 elseif c == "-" then cur.del = cur.del + 1 end
+      if b == 43 then cur.add = cur.add + 1 elseif b == 45 then cur.del = cur.del + 1 end
     elseif cur then
       cur.header[#cur.header + 1] = l
-      if l:match("^new file") then cur.mode = "A"
-      elseif l:match("^deleted file") then cur.mode = "D"
-      elseif l:match("^rename from") then cur.mode = "R"
-      elseif l:match("^Binary files") then cur.binary = true end
+      if b == 110 and l:match("^new file") then cur.mode = "A"
+      elseif b == 100 and l:match("^deleted file") then cur.mode = "D"
+      elseif b == 114 and l:match("^rename from") then cur.mode = "R"
+      elseif b == 66 and l:match("^Binary files") then cur.binary = true end
     end
-  end
+  end)
   return files
 end
 
@@ -1534,7 +1861,7 @@ end
 -- opts.win: open in that window instead of the current one (focus stays where it is); opts.summary: files start folded
 function show(rev, opts)
   opts = opts or {}
-  local hdr, files, pending = nil, nil, opts.diff and 1 or 2
+  local hdr, files, pending = nil, nil, (opts.diff or not opts.stash) and 1 or 2
   local function done()
     pending = pending - 1
     if pending > 0 then return end
@@ -1565,6 +1892,7 @@ function show(rev, opts)
 
     local function draw()
       local add, L, H, R = builder()
+      local R_spans = {}
       local sub = "GitSubtleText"
       if opts.diff then
         add({ { "Diff     ", sub }, { rev, "GitObjectId" } }, item())
@@ -1613,16 +1941,18 @@ function show(rev, opts)
           item({ vfile = i }))
         file_row[i] = #L
         if open[i] then
-          for _, h in ipairs(f.hunks) do
-            add({ { h.header, "GitHunkHeader" } }, item({ vfile = i, hunk = h, idx = 0 }))
-            for j, l in ipairs(h.lines) do -- hot loop: add() inlined, as in the status
-              local c, n = l:byte(1), #L
-              local g = c == 43 and "GitDiffAdd" or c == 45 and "GitDiffDelete" or nil -- + -
-              if g then H[#H + 1] = { n, 0, #l, g } end
-              L[n + 1], R[n + 1] = l, item({ vfile = i, hunk = h, idx = j })
-            end
+          if not f.seg then
+            local SL, SH, spans = diff_seg(f.hunks)
+            f.seg = { L = SL, H = SH, spans = spans }
           end
+          local seg, n = f.seg, #L
+          for x, l in ipairs(seg.L) do L[n + x] = l end
+          if #seg.L > 0 then R_spans[#R_spans + 1] = { s = n + 1, e = n + #seg.L, vfile = i, spans = seg.spans } end
+          if #seg.H > 0 then H[#H + 1] = { n, seg = seg.H, n = #seg.L } end
         end
+      end
+      if #R_spans > 0 then
+        attach_spans(R, R_spans, function(fs, hs, idx) return item({ vfile = fs.vfile, hunk = hs.hunk, idx = idx }) end)
       end
       paint(buf, L, H)
       S.rows[buf] = R
@@ -1673,22 +2003,35 @@ function show(rev, opts)
       close_fold = function() fold("c") end, open_all = function() all(true) end, close_all = function() all(false) end,
       move_hunk = move })
   end
-  if not opts.diff then
-    git({ "log", "-1", "--format=%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%at%x1f%P%x1f%B", rev }, nil, function(r)
-      local t = vim.split(r.stdout or "", "\31", { plain = true })
-      if r.code == 0 and #t >= 8 then
-        local msg = vim.split(vim.trim(table.concat(vim.list_slice(t, 8), "\31")), "\n", { plain = true })
-        local body = vim.list_slice(msg, 2)
-        while body[1] == "" do table.remove(body, 1) end
-        hdr = { short = t[2], refs = t[3], author = t[4], email = t[5], at = t[6], parents = vim.split(t[7], " ", { trimempty = true }),
-          subject = msg[1] or "", body = body }
+  local function parse_hdr(out)
+    local t = vim.split(out or "", "\31", { plain = true })
+    if #t >= 8 then
+      local msg = vim.split(vim.trim(table.concat(vim.list_slice(t, 8), "\31")), "\n", { plain = true })
+      local body = vim.list_slice(msg, 2)
+      while body[1] == "" do table.remove(body, 1) end
+      hdr = { short = t[2], refs = t[3], author = t[4], email = t[5], at = t[6], parents = vim.split(t[7], " ", { trimempty = true }),
+        subject = msg[1] or "", body = body }
+    end
+  end
+  if not opts.diff and not opts.stash then -- regular commits: header and patch in one git show
+    git({ "show", "--format=%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%at%x1f%P%x1f%B%x1e", "--patch", "--diff-merges=first-parent", rev }, nil, function(r)
+      if r.code == 0 then
+        local sep = (r.stdout or ""):find("\30", 1, true)
+        parse_hdr(sep and r.stdout:sub(1, sep - 1) or r.stdout)
+        files = parse_files(sep and r.stdout:sub(sep + 1) or "")
       end
       done()
     end)
+    return
   end
   local spin = opts.msg and progress(opts.msg, rev)
-  git(nil, { raw = opts.diff or (opts.stash and { "git", "stash", "show", "-p", "--include-untracked", rev })
-    or { "git", "show", "--format=", "--patch", "--diff-merges=first-parent", rev } }, function(r)
+  if not opts.diff then
+    git({ "log", "-1", "--format=%H%x1f%h%x1f%D%x1f%an%x1f%ae%x1f%at%x1f%P%x1f%B", rev }, nil, function(r)
+      if r.code == 0 then parse_hdr(r.stdout) end
+      done()
+    end)
+  end
+  git(nil, { raw = opts.diff or { "git", "stash", "show", "-p", "--include-untracked", rev } }, function(r)
     if opts.diff and r.code ~= 0 then
       fail("diff", r, spin)
     else
@@ -1764,43 +2107,70 @@ local function absorb()
   if not st then return end
   if #st.staged == 0 then return notify("absorb: nothing staged", vim.log.levels.WARN) end
   local tmp = S.gitdir .. "/petal-absorb-index"
-  job("absorb", tmp, function(run)
-    local head = vim.trim(run({ "rev-parse", "HEAD" }))
-    -- rewritable = on no remote: pushed history is never rewritten
-    local own, list = {}, lines(run({ "rev-list", "HEAD", "--not", "--remotes" }))
-    for i, c in ipairs(list) do own[c] = i end -- i: 1 = newest
-    if #list == 0 then return notify("absorb: every commit is pushed, nothing to absorb into", vim.log.levels.WARN) end
-    if vim.trim(run({ "rev-list", "--merges", "HEAD", "--not", "--remotes" })) ~= "" then
-      return notify("absorb: unpushed history has merges, a rebase would flatten them", vim.log.levels.WARN)
+  job("absorb", tmp, function(run, raw, wait)
+    -- rewritable = on no remote: pushed history is never rewritten. One log gives HEAD,
+    -- ownership, subjects, parents and merges (a space in %P) of the whole unpushed stack
+    local own, subj, parent_of, list = {}, {}, {}, {}
+    local merge = false
+    for _, l in ipairs(lines(run({ "log", "--format=%H%x1f%P%x1f%h %s", "HEAD", "--not", "--remotes" }))) do
+      local sha, parents, subject = l:match("^(%x+)\31(.-)\31(.*)$")
+      if sha then
+        list[#list + 1] = sha
+        own[sha], subj[sha] = #list, subject -- i: 1 = newest
+        parent_of[sha] = parents:match("^(%x+)")
+        merge = merge or parents:find(" ", 1, true) ~= nil
+      end
     end
+    if #list == 0 then return notify("absorb: every commit is pushed, nothing to absorb into", vim.log.levels.WARN) end
+    if merge then return notify("absorb: unpushed history has merges, a rebase would flatten them", vim.log.levels.WARN) end
+    local head = list[1]
     -- blame stops at the unpushed range: older lines show as its boundary (not own, so refused) instead
     -- of git walking the whole history per file (86ms -> 7ms on a 10k-commit file)
-    local range = vim.split(vim.trim(run({ "rev-list", "--parents", "-n", "1", list[#list] })), " ")[2]
-    range = range and (range .. "..HEAD") or "HEAD"
+    local oldest_parent = parent_of[list[#list]]
+    local range = oldest_parent and (oldest_parent .. "..HEAD") or "HEAD"
     local files = parse_files(run({ "diff", "--cached", "-U0", "--no-renames", "--no-color", "--no-ext-diff",
       "--src-prefix=a/", "--dst-prefix=b/" }))
+    local plain_files, plain = {}, {}
     local groups, by, kept = {}, {}, 0 -- groups in first-seen order; hunk.group = its index
     for _, f in ipairs(files) do
-      local plain = f.mode == "M" and not f.binary
-      for _, l in ipairs(f.header) do if l:match("^old mode") then plain = false end end
-      if not plain then
+      local ok = f.mode == "M" and not f.binary
+      for _, l in ipairs(f.header) do if l:match("^old mode") then ok = false end end
+      if not ok then
         kept = kept + math.max(#f.hunks, 1)
       else
-        local owner = {}
-        for _, l in ipairs(lines(run({ "blame", "-l", "-s", range, "--", f.path }))) do owner[#owner + 1] = l:match("^%^?(%x+)") end
-        for _, h in ipairs(f.hunks) do
-          local c = hunk_owner(h.header, owner, own)
-          if not c then
-            kept = kept + 1
-          else
-            if not by[c] then
-              by[c] = { sha = c, files = {}, n = 0 }
-              groups[#groups + 1] = by[c]
-              by[c].i = #groups
-            end
-            h.group, h.sha, by[c].n = by[c].i, c, by[c].n + 1
-            by[c].files[f.path] = true
+        plain_files[#plain_files + 1], plain[f.path] = f, {}
+      end
+    end
+    local function blame_out(i, out)
+      local owner = {}
+      for _, l in ipairs(lines(out)) do owner[#owner + 1] = l:match("^%^?(%x+)") end
+      plain[plain_files[i].path] = owner
+    end
+    if #plain_files > 1 then
+      local cmds = {}
+      for _, f in ipairs(plain_files) do cmds[#cmds + 1] = { "blame", "-l", "-s", range, "--", f.path } end
+      local res = wait(function(done) git_batch(cmds, done) end)
+      for i, r in ipairs(res) do
+        if r.code ~= 0 then error(failure(r), 0) end
+        blame_out(i, r.stdout)
+      end
+    elseif #plain_files == 1 then
+      blame_out(1, run({ "blame", "-l", "-s", range, "--", plain_files[1].path }))
+    end
+    for _, f in ipairs(plain_files) do
+      local owner = plain[f.path]
+      for _, h in ipairs(f.hunks) do
+        local c = hunk_owner(h.header, owner, own)
+        if not c then
+          kept = kept + 1
+        else
+          if not by[c] then
+            by[c] = { sha = c, files = {}, n = 0 }
+            groups[#groups + 1] = by[c]
+            by[c].i = #groups
           end
+          h.group, h.sha, by[c].n = by[c].i, c, by[c].n + 1
+          by[c].files[f.path] = true
         end
       end
     end
@@ -1812,7 +2182,7 @@ local function absorb()
     for _, f in ipairs(files) do for _, h in ipairs(f.hunks) do if h.group then h.group = by[h.sha].i end end end
     local preview = {}
     for _, g in ipairs(groups) do
-      g.subject = vim.trim(run({ "log", "-1", "--format=%h %s", g.sha }))
+      g.subject = subj[g.sha]
       preview[#preview + 1] = ("%s  ← %d hunk%s in %s"):format(g.subject, g.n, g.n > 1 and "s" or "", table.concat(vim.tbl_keys(g.files), ", "))
     end
     if kept > 0 then preview[#preview + 1] = kept == 1 and "1 hunk stays staged (no single unpushed owner)"
@@ -1841,7 +2211,8 @@ local function absorb()
     -- --autostash brings staged changes back unstaged; autosquash keeps HEAD's final tree, so the
     -- saved index tree is still exactly what was staged
     local index = vim.trim(run({ "write-tree" }))
-    act({ "rebase", "-i", "--autosquash", "--autostash", base_of(groups[1].sha) }, { env = { GIT_SEQUENCE_EDITOR = "true" },
+    local first = groups[1].sha
+    act({ "rebase", "-i", "--autosquash", "--autostash", parent_of[first] and (first .. "^") or "--root" }, { env = { GIT_SEQUENCE_EDITOR = "true" },
       after = function()
         act({ "read-tree", index }, { after = function()
           notify(("absorb: %d commit(s) fixed up, was %s (reflog)"):format(#groups, head:sub(1, 7)))
@@ -1864,21 +2235,31 @@ move_hunk = function(commit, f, hunks)
   local tmp = S.gitdir .. "/petal-move-index"
   local env = { GIT_INDEX_FILE = tmp }
   job("move", tmp, function(run, raw, wait)
-    local head = vim.trim(run({ "rev-parse", "HEAD" }))
-    local X = vim.trim(run({ "rev-parse", commit }))
     -- the unpushed stack, oldest first, with everything the replay needs in one call (not 2 per commit)
     local chain, pos = {}, {}
-    local log = run({ "log", "--reverse", "--date=raw", "--format=%H%x1f%T%x1f%h %s%x1f%an%x1f%ae%x1f%ad%x1f%B%x1e", "HEAD", "--not", "--remotes" })
+    local log = run({ "log", "--reverse", "--date=raw", "--format=%H%x1f%T%x1f%P%x1f%h %s%x1f%an%x1f%ae%x1f%ad%x1f%B%x1e", "HEAD", "--not", "--remotes" })
     for rec in vim.gsplit(log, "\30", { plain = true }) do
       local f = vim.split(rec:gsub("^\n", ""), "\31", { plain = true })
-      if #f >= 7 then
-        chain[#chain + 1] = { sha = f[1], tree = f[2], title = f[3], an = f[4], ae = f[5], ad = f[6], msg = table.concat(vim.list_slice(f, 7), "\31") }
+      if #f >= 8 then
+        chain[#chain + 1] = { sha = f[1], tree = f[2], parents = vim.split(f[3], " ", { trimempty = true }), title = f[4],
+          an = f[5], ae = f[6], ad = f[7], msg = table.concat(vim.list_slice(f, 8), "\31") }
         pos[f[1]] = #chain
       end
     end
+    if #chain == 0 then return notify("move: " .. commit .. " is pushed (or not on this branch), it can't be rewritten", vim.log.levels.WARN) end
+    local head, head_tree = chain[#chain].sha, chain[#chain].tree
+    local X
+    if commit:match("^%x+$") then
+      local n = 0
+      for _, c in ipairs(chain) do
+        if vim.startswith(c.sha, commit) then X, n = c.sha, n + 1 end
+      end
+      if n ~= 1 then X = nil end
+    end
+    X = X or vim.trim(run({ "rev-parse", commit }))
     if not pos[X] then return notify("move: " .. commit .. " is pushed (or not on this branch), it can't be rewritten", vim.log.levels.WARN) end
-    if vim.trim(run({ "rev-list", "--merges", "HEAD", "--not", "--remotes" })) ~= "" then
-      return notify("move: unpushed history has merges", vim.log.levels.WARN)
+    for _, c in ipairs(chain) do
+      if #c.parents > 1 then return notify("move: unpushed history has merges", vim.log.levels.WARN) end
     end
     local NEW = "+ new commit right after " .. chain[pos[X]].title
     local items = { NEW }
@@ -1892,8 +2273,8 @@ move_hunk = function(commit, f, hunks)
     end
     local forward = not Y or pos[Y] > pos[X] -- X loses the hunk before it reappears
     local lo = math.min(pos[X], Y and pos[Y] or pos[X])
-    local parents = vim.split(vim.trim(run({ "rev-list", "--parents", "-n", "1", chain[lo].sha })), " ")
-    if not parents[2] then return notify("move: can't rewrite the root commit", vim.log.levels.WARN) end
+    local p1 = chain[lo].parents[1]
+    if not p1 then return notify("move: can't rewrite the root commit", vim.log.levels.WARN) end
 
     local function patched(tree, reverse, at)
       run({ "read-tree", tree }, env)
@@ -1906,7 +2287,7 @@ move_hunk = function(commit, f, hunks)
         { GIT_AUTHOR_NAME = c.an, GIT_AUTHOR_EMAIL = c.ae, GIT_AUTHOR_DATE = c.ad }, c.msg))
     end
 
-    local parent, orig = parents[2], parents[2]
+    local parent, orig = p1, p1
     local ptree, dropped = vim.trim(run({ "rev-parse", parent .. "^{tree}" })), {}
     for i = lo, #chain do
       local c = chain[i]
@@ -1934,7 +2315,7 @@ move_hunk = function(commit, f, hunks)
       parent, orig, ptree = new, c.sha, tree
     end
     -- moving changes which commit holds the hunk, never the end result
-    if vim.trim(run({ "rev-parse", parent .. "^{tree}" })) ~= vim.trim(run({ "rev-parse", head .. "^{tree}" })) then
+    if vim.trim(run({ "rev-parse", parent .. "^{tree}" })) ~= head_tree then
       error("the result would differ from HEAD, nothing changed", 0)
     end
     run({ "update-ref", "-m", "petal: move hunk", "HEAD", parent, head })
@@ -2035,25 +2416,33 @@ local mns = vim.api.nvim_create_namespace("petal_merge")
 local function blocks(buf)
   local out, cur = {}, nil
   for i, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
-    if l:match("^<<<<<<<") then cur = { s = i }
-    elseif cur and l:match("^|||||||") then cur.b = i
-    elseif cur and l:match("^=======$") then cur.m = i
-    elseif cur and l:match("^>>>>>>>") and cur.m then cur.e = i; out[#out + 1], cur = cur, nil end
+    local b = l:byte(1)
+    if b == 60 and l:match("^<<<<<<<") then cur = { s = i }
+    elseif cur and b == 124 and l:match("^|||||||") then cur.b = i
+    elseif cur and b == 61 and l:match("^=======$") then cur.m = i
+    elseif cur and b == 62 and l:match("^>>>>>>>") and cur.m then cur.e = i; out[#out + 1], cur = cur, nil end
   end
   return out
 end
 
 local function paint_merge(buf, labels)
   vim.api.nvim_buf_clear_namespace(buf, mns, 0, -1)
+  local opt = {}
   for _, c in ipairs(blocks(buf)) do
-    local function hl(a, b, g) for r = a, b do vim.api.nvim_buf_set_extmark(buf, mns, r - 1, 0, { line_hl_group = g }) end end
+    local function hl(a, b, g)
+      opt.line_hl_group, opt.virt_text, opt.virt_text_pos = g, nil, nil
+      for r = a, b do vim.api.nvim_buf_set_extmark(buf, mns, r - 1, 0, opt) end
+    end
     for _, r in ipairs({ c.s, c.b, c.m, c.e }) do hl(r, r, "GitMergeMarker") end
     hl(c.s + 1, (c.b or c.m) - 1, "GitMergeOurs")
     if c.b then hl(c.b + 1, c.m - 1, "GitMergeBase") end
     hl(c.m + 1, c.e - 1, "GitMergeTheirs")
     if labels then
-      vim.api.nvim_buf_set_extmark(buf, mns, c.s - 1, 0, { virt_text = { { labels.ours, "Comment" } }, virt_text_pos = "eol" })
-      vim.api.nvim_buf_set_extmark(buf, mns, c.e - 1, 0, { virt_text = { { labels.theirs, "Comment" } }, virt_text_pos = "eol" })
+      opt.line_hl_group, opt.virt_text_pos = nil, "eol"
+      opt.virt_text = { { labels.ours, "Comment" } }
+      vim.api.nvim_buf_set_extmark(buf, mns, c.s - 1, 0, opt)
+      opt.virt_text = { { labels.theirs, "Comment" } }
+      vim.api.nvim_buf_set_extmark(buf, mns, c.e - 1, 0, opt)
     end
   end
 end
@@ -2471,7 +2860,9 @@ function P.commit()
         { "F", "Instant fixup", function(_, ctx)
           commits(ctx, function(cs)
             act({ "commit", "--fixup=" .. cs[1] }, { after = function()
-              act({ "rebase", "-i", "--autosquash", "--autostash", base_of(cs[1]) }, { env = { GIT_SEQUENCE_EDITOR = "true" } })
+              base_of(cs[1], function(base)
+                act({ "rebase", "-i", "--autosquash", "--autostash", base }, { env = { GIT_SEQUENCE_EDITOR = "true" } })
+              end)
             end })
           end)
         end },
@@ -2607,12 +2998,13 @@ local function branches(kind)
   local first
   local function load()
     -- the remote list reads refs/heads too: which remote branches a local one still has
-    git({ "for-each-ref", "--sort=-committerdate", "refs/heads", edit and "refs/heads" or "refs/remotes",
-      "--format=%(refname:short)%09%(objectname)%09%(HEAD)%09%(committerdate:unix)%09%(upstream:short)%09"
-        .. "%(upstream:remotename)%09%(upstream:remoteref)%09%(refname)%09%(symref:short)%09%(contents:subject)" }, nil, function(r)
+    git(cat({ "for-each-ref", "--sort=-committerdate", "refs/heads" }, edit and {} or { "refs/remotes" },
+      { "--format=%(refname:short)%09%(objectname)%09%(HEAD)%09%(committerdate:unix)%09%(upstream:short)%09"
+        .. "%(upstream:remotename)%09%(upstream:remoteref)%09%(refname)%09%(symref:short)%09%(contents:subject)" }), nil, function(r)
       if not vim.api.nvim_buf_is_valid(buf) then return end
       orig = {}
       local L, locals, defaults = {}, {}, {}
+      local now = os.time()
       for _, l in ipairs(lines(r.stdout)) do
         local f = vim.split(l, "\t", { plain = true })
         local name = f[1]
@@ -2625,7 +3017,7 @@ local function branches(kind)
         -- remote list: only configured remotes, never <remote>/HEAD
         elseif edit or (rem and set[rem]) then
           local up = f[5] ~= "" and f[5] or nil
-          local o = { id = #orig + 1, name = name, short = short, sha = f[2], head = f[3] == "*", age = age(f[4]), upstream = up,
+          local o = { id = #orig + 1, name = name, short = short, sha = f[2], head = f[3] == "*", age = age(f[4], now), upstream = up,
             up_remote = f[6], up_ref = f[7], subject = table.concat(f, "\t", 10) }
           -- a PR's head is the branch on the remote: the upstream's name when there is one
           o.pr_key = edit and (up and f[7]:gsub("^refs/heads/", "") or name) or short
@@ -2758,14 +3150,17 @@ local function branches(kind)
     -- the cleanup in one key: drop every line that is safe to delete, then :w
     vim.keymap.set("n", "X", function()
       local n = 0
-      for i = vim.api.nvim_buf_line_count(buf), 1, -1 do -- bottom up: line numbers stay valid
-        local l = vim.api.nvim_buf_get_lines(buf, i - 1, i, false)[1]
+      local all = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+      local kept = {}
+      for _, l in ipairs(all) do
         local b = orig[tonumber(l:match("^/(%d+) ") or "")]
         if b and l == "/" .. b.id .. " " .. b.name and not remote_unsafe(b, prs()[b.pr_key]) then
-          vim.api.nvim_buf_set_lines(buf, i - 1, i, false, {})
           n = n + 1
+        else
+          kept[#kept + 1] = l
         end
       end
+      if n > 0 then vim.api.nvim_buf_set_lines(buf, 0, -1, false, kept) end
       notify(n > 0 and ("remote branches: " .. n .. " merged, :w deletes them") or "remote branches: nothing merged to clean")
     end, o)
   end
@@ -3038,9 +3433,11 @@ function P.rebase()
         end },
       } },
       { "Rebase", {
-        { "i", "Interactively", function(a, ctx) commits(ctx, function(cs) act(cat({ "rebase", "-i" }, a, { base_of(cs[1]) })) end) end },
+        { "i", "Interactively", function(a, ctx)
+          commits(ctx, function(cs) base_of(cs[1], function(base) act(cat({ "rebase", "-i" }, a, { base })) end) end)
+        end },
         { "f", "Autosquash", function(a, ctx)
-          commits(ctx, function(cs) act(cat({ "rebase", "-i", "--autosquash" }, a, { base_of(cs[1]) })) end)
+          commits(ctx, function(cs) base_of(cs[1], function(base) act(cat({ "rebase", "-i", "--autosquash" }, a, { base })) end) end)
         end },
       } },
     } })
@@ -3180,6 +3577,8 @@ local function close()
 end
 
 local function with(fn) return function() fn(context()) end end
+-- header lines (Head/Merge/Push/PR) and blanks carry no item: the key does nothing there, like s
+local function on_item(fn) return function() if (S.rows[S.buf] or {})[vim.fn.line(".")] then fn() end end end
 
 local KEYS
 -- the default keys simple mode keeps; any other action can still be bound through C.mappings
@@ -3247,11 +3646,11 @@ KEYS = {
     { "S", "stage_unstaged", "Stage unstaged", function() act({ "add", "-u" }) end },
     { "u", "unstage", "Unstage", with(unstage), true }, { "U", "unstage_all", "Unstage all", unstage_all },
     { "x", "discard", "Discard", with(discard), true },
-    { "a", "absorb", "Absorb staged into unpushed commits", absorb },
+    { "a", "absorb", "Absorb staged into unpushed commits", on_item(absorb) },
     { "o", "move_hunk", "Move hunk to another commit (in a commit view)", function()
       notify("move: open a commit (<cr> on it), then o on a hunk or file", vim.log.levels.WARN)
     end },
-    { "d", "diff", "Diff mode (against HEAD)", vimdiff }, { "e", "merge_mode", "Merge mode (conflict)", merge_mode },
+    { "d", "diff", "Diff mode (against HEAD)", on_item(vimdiff) }, { "e", "merge_mode", "Merge mode (conflict)", on_item(merge_mode) },
   } },
   { "Essential commands", {
     { "<c-r>", "refresh", "Refresh", M.refresh }, { "<cr>", "goto", "Go to file", goto_item },
@@ -3339,7 +3738,8 @@ function watch_sync()
     if root ~= S.root or r.code ~= 0 then return end
     local want = { [gitdir] = true, [gitdir .. "/refs"] = true, [gitdir .. "/refs/heads"] = true, [root] = true }
     local n = 0
-    local out, i, prev = r.stdout, 1, nil
+    local out, i, prev = r.stdout or "", 1, nil
+    local seen = {}
     -- byte scan, no split/match per path (30k paths: 22ms -> 2ms); ls-files is sorted, so a path in
     -- the same dir as the one before is skipped outright
     while n < WATCH_MAX do
@@ -3354,8 +3754,12 @@ function watch_sync()
       i = j + 1
       if dir ~= prev then
         prev = dir
-        while dir and not want[root .. "/" .. dir] and n < WATCH_MAX do
-          want[root .. "/" .. dir], n = true, n + 1
+        while dir and n < WATCH_MAX do
+          if seen[dir] then break end
+          seen[dir] = true
+          local abs = root .. "/" .. dir
+          if want[abs] then break end
+          want[abs], n = true, n + 1
           dir = dir:match("^(.*)/[^/]*$")
         end
       end
@@ -3403,14 +3807,25 @@ function M.open()
   end
   local same = root == S.root
   if not same then
-    S.open, S.diffs, S.data, S.fetch.at, S.base, S.radar_cache = {}, {}, nil, -math.huge, nil, {}
+    S.open, S.diffs, S.data, S.fetch.at, S.base, S.radar_cache, S.stash_cache, S.raw_diff = {}, {}, nil, -math.huge, nil, {}, nil, {}
     unwatch_all()
   end
   S.root, S.gitdir = root, gitdir
+  if not same then
+    local common, h = gitdir, io.open(gitdir .. "/commondir")
+    if h then
+      local c = vim.trim(h:read("*a"))
+      h:close()
+      common = c:sub(1, 1) == "/" and c or (gitdir .. "/" .. c)
+    end
+    S.commondir = common
+    S.reftable = vim.uv.fs_stat(common .. "/reftable") ~= nil
+  end
   -- repo-wide attribute files: when one exists, untracked diffs go through git (attrs_may_apply).
   -- the lookup rides along with the next refresh's batch; until it answers untracked diffs take the
   -- (always right) git path
-  S.attrs, S.attrs_check = true, true
+  if vim.uv.fs_stat(gitdir .. "/info/attributes") ~= nil then S.attrs, S.attrs_check = true, nil
+  else S.attrs, S.attrs_check = true, true end
   S.pr_at = {} -- opening always rechecks the PR
   -- git's own cache file (what gc writes): ~1s once in the background, and later commits stay fast
   if S.graph_root ~= root and not has_commit_graph() then
@@ -3578,7 +3993,7 @@ M._t = {
     return t
   end,
   bindings = bindings, parse_status = parse_status, parse_diff = parse_diff, split_diff = split_diff, parse_merge_tree = parse_merge_tree, git_batch = git_batch, paint = paint, ns = ns, untracked_diff = untracked_diff, hunk_owner = hunk_owner, parse_conflicts = parse_conflicts,
-  parse_files = parse_files, patch = patch, branch_plan = branch_plan, branches = branches, remote_unsafe = remote_unsafe, kind_of = kind_of, ci_summary = ci_summary, failure = failure, cut = cut, refchunks = refchunks, S = S,
+  parse_files = parse_files, split_diff_raw = split_diff_raw, patch = patch, branch_plan = branch_plan, branches = branches, remote_unsafe = remote_unsafe, kind_of = kind_of, ci_summary = ci_summary, failure = failure, cut = cut, refchunks = refchunks, show = show, S = S,
 }
 
 return M

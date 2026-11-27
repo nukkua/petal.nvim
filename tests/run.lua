@@ -97,6 +97,21 @@ test("parse_conflicts", function()
   eq(cs[1], { line = 2, ours = { "ours" }, base = { "base" }, theirs = { "theirs", "t2" } })
   eq(cs[2], { line = 11, ours = {}, base = {}, theirs = { "only theirs" } })
   eq(t.parse_conflicts(dir .. "/missing"), {})
+
+  local h = assert(io.open(dir .. "/conf-empty.txt", "wb")) -- empty lines everywhere, no trailing newline
+  h:write("\n<<<<<<< HEAD\n\nours\n=======\n\ntheirs\n>>>>>>> other")
+  h:close()
+  eq(t.parse_conflicts(dir .. "/conf-empty.txt"), {
+    { line = 2, ours = { "", "ours" }, base = {}, theirs = { "", "theirs" } },
+  })
+  h = assert(io.open(dir .. "/conf-crlf.txt", "wb")) -- CRLF content; git's own marker lines end in LF
+  h:write("top\r\n<<<<<<< HEAD\nours\r\n=======\ntheirs\r\n>>>>>>> other\n")
+  h:close()
+  eq(t.parse_conflicts(dir .. "/conf-crlf.txt"), {
+    { line = 2, ours = { "ours\r" }, base = {}, theirs = { "theirs\r" } },
+  })
+  h = assert(io.open(dir .. "/plain-crlf.txt", "wb")); h:write("a\r\nb\r\n"); h:close()
+  eq(t.parse_conflicts(dir .. "/plain-crlf.txt"), {})
 end)
 
 test("parse_files", function()
@@ -424,10 +439,38 @@ test("git_batch: one process, same results as one spawn per command", function()
       eq(res[i].stdout, want.stdout, mode .. " stdout " .. table.concat(args, " "))
     end
   end
-  local partial = run([[printf 'partial' >"$1/1"; printf '0' >"$1/1.c"]])
+  local partial = run([[printf 'partial' >"$1/1"; printf '1 0\n']])
   eq(#partial, #cmds, "an incomplete batch should rerun every command")
   eq(partial[1].stdout, g(cmds[1]).stdout, "fallback should discard partial batch output")
   t.S.root = root
+  vim.fn.delete(gdir, "rf")
+end)
+
+test("git_batch: 20 concurrent commands all come back in order", function()
+  local gdir = vim.fn.tempname()
+  vim.fn.mkdir(gdir, "p")
+  local function g(args) return vim.system(vim.list_extend({ "git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false" }, args), { cwd = gdir, text = true }):wait() end
+  g({ "init", "-q" })
+  for i = 1, 4 do
+    vim.fn.writefile({ tostring(i) }, gdir .. "/x")
+    g({ "add", "x" }); g({ "commit", "-qm", "c" .. i })
+  end
+  local cmds, want = {}, {}
+  for i = 1, 20 do
+    local rev = "HEAD~" .. ((i - 1) % 4)
+    cmds[i] = { "show", "-s", "--format=%h %s", rev }
+    want[i] = vim.system(vim.list_extend({ "git" }, cmds[i]), { cwd = gdir, text = true }):wait().stdout
+  end
+  local root = t.S.root
+  t.S.root = gdir
+  local res
+  t.git_batch(cmds, function(r) res = r end)
+  assert(vim.wait(10000, function() return res ~= nil end, 5), "git_batch stress never answered")
+  t.S.root = root
+  for i = 1, 20 do
+    eq(res[i].code, 0, "code " .. i)
+    eq(res[i].stdout, want[i], "stdout " .. i)
+  end
   vim.fn.delete(gdir, "rf")
 end)
 
@@ -442,13 +485,14 @@ test("parse_diff: split lines give the same result as the joined text", function
   put("a", "1\n\n3\n\n\n"); put("b", "x\r\nz\r\n"); put("c", "p\nr")
   for _, extra in ipairs({ {}, { "-c", "diff.suppressBlankEmpty=true" } }) do
     local out = bgit(vim.list_extend(vim.list_extend({}, extra), { "diff", "--src-prefix=a/", "--dst-prefix=b/" }))
-    local by = t.split_diff(out)
+    local by, rawby = t.split_diff(out), t.split_diff_raw(out)
     for _, p in ipairs({ "a", "b", "c" }) do
       local ls = by["diff --git a/" .. p .. " b/" .. p]
       local old = t.parse_diff(table.concat(ls, "\n"))
       local copy = vim.list_extend({}, ls)
       while copy[#copy] == "" do copy[#copy] = nil end
       eq(t.parse_diff(copy), old, p .. " " .. table.concat(extra, " "))
+      eq(t.parse_diff(rawby["diff --git a/" .. p .. " b/" .. p]), old, p .. " raw " .. table.concat(extra, " "))
     end
   end
   vim.fn.delete(bdir, "rf")
@@ -1214,6 +1258,202 @@ test("d: ZZ from the HEAD pane writes the file and returns, ZQ drops the edit; t
   eq(vim.fn.filereadable(f), 0, "ZZ wrote the deleted file")
   vim.cmd.cd(cwd)
   vim.fn.delete(rdir, "rf")
+end)
+
+test("refresh: raw diff cache keeps unchanged file objects; lazy rows keep cursor and visual staging", function()
+  local rdir, g = repo()
+  local base = {}
+  for i = 1, 12 do base[i] = "line " .. i end
+  vim.fn.writefile(vim.deepcopy(base), rdir .. "/a.txt")
+  vim.fn.writefile(vim.deepcopy(base), rdir .. "/b.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "base" })
+  local function change(path, extra)
+    local l = vim.deepcopy(base)
+    l[6] = path:sub(1, 1) .. "2"
+    if extra then l[#l + 1] = extra end
+    vim.fn.writefile(l, rdir .. "/" .. path)
+  end
+  change("a.txt"); change("b.txt")
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  petal.open()
+  assert(vim.wait(3000, function() return t.S.data and #t.S.data.st.unstaged == 2 end, 10), "status never rendered")
+  vim.fn.maparg("zR", "n", false, true).callback()
+  assert(shown("^+a2$") and shown("^+b2$"), "diffs not expanded")
+  local a, b = t.S.diffs["unstaged:a.txt"], t.S.diffs["unstaged:b.txt"]
+  assert(a and b and a.seg and b.seg, "batched diffs or cached segments missing")
+  local row = vim.fn.search("^+b2$", "nw")
+  vim.api.nvim_win_set_cursor(0, { row, 0 })
+  change("a.txt", "a3") -- only a's raw chunk changes; b must reuse the exact parsed object
+  petal.refresh()
+  assert(shown("^+a3$"), "edited diff not redrawn")
+  assert(t.S.diffs["unstaged:b.txt"] == b, "unchanged file lost its exact diff object")
+  assert(t.S.diffs["unstaged:a.txt"] ~= a, "edited file kept its old diff object")
+  local cur = vim.api.nvim_win_get_cursor(0)[1]
+  eq(vim.api.nvim_buf_get_lines(t.S.buf, cur - 1, cur, false)[1], "+b2", "cursor did not stay on the same lazy diff row")
+  local marks = vim.api.nvim_buf_get_extmarks(t.S.buf, t.ns, { cur - 1, 0 }, { cur - 1, -1 }, { details = true })
+  eq(marks[1] and marks[1][4].hl_group, "GitDiffAdd")
+  vim.api.nvim_feedkeys("Vks", "x", false) -- select -b1/+b2 through lazy R rows, then stage just them
+  assert(vim.wait(5000, function()
+    local d = g({ "diff", "--cached", "--", "b.txt" })
+    return d:find("\n-line 6\n", 1, true) and d:find("\n+b2\n", 1, true)
+  end, 20), "visual hunk lines were not staged")
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+end)
+
+test("show: one process renders normal, root and empty commits; folds reuse cached rows", function()
+  local rdir, g = repo()
+  vim.fn.writefile({ "one" }, rdir .. "/f.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "root commit" })
+  local root = vim.trim(g({ "rev-parse", "HEAD" }))
+  vim.fn.writefile({ "one", "two" }, rdir .. "/f.txt")
+  g({ "commit", "-qam", "second commit" })
+  g({ "commit", "-q", "--allow-empty", "-m", "empty commit" })
+  local cwd, oldroot = vim.fn.getcwd(), t.S.root
+  vim.cmd.cd(rdir)
+  t.S.root = rdir
+  local counts, real = { show = 0, log1 = 0 }, vim.system
+  vim.system = function(cmd, ...)
+    if cmd[1] == "git" and cmd[2] == "show" then counts.show = counts.show + 1 end
+    if cmd[1] == "git" and cmd[2] == "log" and cmd[3] == "-1" then counts.log1 = counts.log1 + 1 end
+    return real(cmd, ...)
+  end
+  local function lines_of(buf) return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n") end
+  local function open_show(rev, pat)
+    t.show(rev)
+    assert(vim.wait(3000, function()
+      local buf = vim.api.nvim_get_current_buf()
+      return vim.api.nvim_buf_get_name(buf):find("git://show ", 1, true) and lines_of(buf):find(pat, 1, true)
+    end, 10), "show never rendered " .. pat)
+    return vim.api.nvim_get_current_buf()
+  end
+  local buf = open_show("HEAD~1", "second commit")
+  assert(lines_of(buf):find("+two", 1, true), "patch missing")
+  vim.api.nvim_win_set_cursor(0, { vim.fn.search("^modified\\s\\+f\\.txt", "nw"), 0 })
+  local function keycb(k) return vim.fn.maparg(k, "n", false, true).callback() end
+  keycb("za")
+  assert(not lines_of(buf):find("+two", 1, true), "za did not fold the file")
+  keycb("zR")
+  assert(lines_of(buf):find("+two", 1, true), "zR did not reopen the cached file rows")
+  local row = vim.fn.search("^+two$", "nw") - 1
+  local marks = vim.api.nvim_buf_get_extmarks(buf, t.ns, { row, 0 }, { row, -1 }, { details = true })
+  eq(marks[1] and marks[1][4].hl_group, "GitDiffAdd")
+  keycb("zM")
+  assert(not lines_of(buf):find("+two", 1, true), "zM did not fold the files")
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  buf = open_show(root, "root commit")
+  assert(lines_of(buf):find("+one", 1, true), "root patch missing")
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  buf = open_show("HEAD", "Files (0)")
+  assert(lines_of(buf):find("empty commit", 1, true), "empty commit header missing")
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  eq(counts, { show = 3, log1 = 0 })
+  local notes, realnotify = {}, vim.notify
+  vim.notify = function(msg) notes[#notes + 1] = msg end
+  t.show("definitely-not-a-rev")
+  assert(vim.wait(2000, function() return #notes > 0 end, 10), "invalid rev never notified")
+  vim.notify = realnotify
+  assert(notes[1]:find("show: definitely-not-a-rev not found", 1, true), notes[1])
+  vim.system = real
+  t.S.root = oldroot
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+end)
+
+test("refresh: stash list is cached by reflog/ref stamp and always tracks pushes and drops", function()
+  local rdir, g = repo()
+  vim.fn.writefile({ "base" }, rdir .. "/s.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "base" })
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  petal.open()
+  assert(vim.wait(3000, function() return t.S.data and t.S.data.stashes end, 10), "status never rendered")
+  eq(t.S.data.stashes, {})
+  vim.fn.writefile({ "base", "stashed" }, rdir .. "/s.txt")
+  g({ "stash", "push", "-qm", "saved work" })
+  petal.refresh()
+  assert(vim.wait(3000, function() return t.S.data and #t.S.data.stashes == 1 end, 10), "stash never appeared")
+  assert(t.S.data.stashes[1].subject:find("saved work", 1, true), t.S.data.stashes[1].subject)
+  local cached = t.S.data.stashes
+  petal.refresh()
+  assert(vim.wait(3000, function() return t.S.data and #t.S.data.stashes == 1 end, 10), "cached refresh never landed")
+  assert(t.S.data.stashes == cached, "unchanged stash list was not reused")
+  g({ "stash", "drop", "-q", "stash@{0}" })
+  petal.refresh()
+  assert(vim.wait(3000, function() return t.S.data and #t.S.data.stashes == 0 end, 10), "stash drop never appeared")
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+end)
+
+test("absorb: multiple files blame in one batch and fold into their unpushed owners", function()
+  local rdir, g = repo()
+  local a, b = {}, {}
+  for i = 1, 8 do a[i], b[i] = "a" .. i, "b" .. i end
+  vim.fn.writefile(a, rdir .. "/a.txt"); vim.fn.writefile(b, rdir .. "/b.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "base" })
+  a[3] = "a owned"; vim.fn.writefile(a, rdir .. "/a.txt"); g({ "commit", "-qam", "change a" })
+  b[3] = "b owned"; vim.fn.writefile(b, rdir .. "/b.txt"); g({ "commit", "-qam", "change b" })
+  a[3] = "a absorbed"; vim.fn.writefile(a, rdir .. "/a.txt")
+  b[3] = "b absorbed"; vim.fn.writefile(b, rdir .. "/b.txt")
+  g({ "add", "a.txt", "b.txt" })
+  local counts, real_system = { blame = 0 }, vim.system
+  vim.system = function(cmd, ...)
+    local s = table.concat(cmd, " ")
+    if s:find("blame", 1, true) then counts.blame = counts.blame + 1 end
+    return real_system(cmd, ...)
+  end
+  local real_confirm = vim.fn.confirm
+  vim.fn.confirm = function() return 1 end
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(rdir)
+  petal.open()
+  assert(vim.wait(3000, function() return t.S.data and #t.S.data.st.staged == 2 end, 10), "status never rendered")
+  vim.api.nvim_feedkeys("a", "x", false) -- on the Head line: does nothing
+  vim.wait(200)
+  eq(#t.S.data.st.staged, 2)
+  vim.fn.search("a.txt")
+  vim.api.nvim_feedkeys("a", "x", false)
+  assert(vim.wait(10000, function()
+    return g({ "--no-optional-locks", "status", "--porcelain" }) == "" and g({ "log", "-2", "--format=%s" }) == "change b\nchange a\n"
+  end, 50), "absorb did not finish cleanly")
+  vim.fn.confirm = real_confirm
+  vim.system = real_system
+  eq(g({ "show", "HEAD:b.txt" }), "b1\nb2\nb absorbed\nb4\nb5\nb6\nb7\nb8\n")
+  eq(g({ "show", "HEAD~1:a.txt" }), "a1\na2\na absorbed\na4\na5\na6\na7\na8\n")
+  eq(counts.blame, 1, "two file blames were not in one git_batch process")
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+end)
+
+test("select: multi-select marks update in place and never leak into the next picker", function()
+  local picker = require("petal.select")
+  local mns = vim.api.nvim_create_namespace("petal.select.mark")
+  picker.select({ "one", "two", "three", "four" }, { multi = true, prompt = "Pick" }, function() end)
+  local buf = vim.api.nvim_get_current_buf()
+  assert(vim.bo[buf].filetype == "qf", "picker did not open a quickfix buffer")
+  local function rows()
+    local out = {}
+    for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, mns, 0, -1, { details = true })) do
+      out[m[2] + 1] = { id = m[1], text = m[4].virt_text[1][1] }
+    end
+    return out
+  end
+  local before = rows()
+  eq(#vim.api.nvim_buf_get_extmarks(buf, mns, 0, -1, {}), 4)
+  eq(before[1].text, "[ ] ")
+  vim.api.nvim_feedkeys(vim.keycode("<Tab>"), "x", false)
+  local after = rows()
+  eq(after[1].text, "[x] ")
+  eq(after[2].text, "[ ] ")
+  for i = 1, 4 do eq(after[i].id, before[i].id, "mark " .. i .. " was redrawn") end
+  vim.api.nvim_feedkeys("q", "x", false)
+
+  picker.select({ "one", "two" }, { prompt = "Pick one" }, function() end)
+  local buf2 = vim.api.nvim_get_current_buf()
+  assert(buf2 == buf, "quickfix buffer was not reused")
+  eq(#vim.api.nvim_buf_get_extmarks(buf2, mns, 0, -1, {}), 0, "single-select kept stale multi-select marks")
+  vim.api.nvim_feedkeys("q", "x", false)
 end)
 
 vim.fn.delete(dir, "rf")
