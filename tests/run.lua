@@ -439,6 +439,9 @@ test("git_batch: one process, same results as one spawn per command", function()
       eq(res[i].stdout, want.stdout, mode .. " stdout " .. table.concat(args, " "))
     end
   end
+  local partial = run([[printf 'partial' >"$1/1"; printf '1 0\n']])
+  eq(#partial, #cmds, "an incomplete batch should rerun every command")
+  eq(partial[1].stdout, g(cmds[1]).stdout, "fallback should discard partial batch output")
   t.S.root = root
   vim.fn.delete(gdir, "rf")
 end)

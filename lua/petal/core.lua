@@ -275,8 +275,8 @@ local function slurp(p)
   return v
 end
 local function git_batch(cmds, cb)
-  local function fallback(res)
-    local left = #cmds
+  local function fallback()
+    local res, left = {}, #cmds
     for i, args in ipairs(cmds) do
       git(args, nil, function(x)
         res[i], left = x, left - 1
@@ -285,7 +285,7 @@ local function git_batch(cmds, cb)
     end
   end
   local dir = vim.fn.tempname() -- inside nvim's own temp dir, which nvim removes on exit
-  if not vim.uv.fs_mkdir(dir, 448) then return fallback({}) end
+  if not vim.uv.fs_mkdir(dir, 448) then return fallback() end
   local argv = { "sh", "-c", M._batch_sh or BATCH_SH, "petal", dir }
   for _, args in ipairs(cmds) do
     local q = { "git" }
@@ -293,13 +293,12 @@ local function git_batch(cmds, cb)
     argv[#argv + 1] = table.concat(q, " ")
   end
   git(nil, { raw = argv, text = false }, function(r)
-    local res = {}
     if r.code ~= 0 then
       for i = 1, #cmds do vim.uv.fs_unlink(dir .. "/" .. i) end
       vim.uv.fs_rmdir(dir)
-      return fallback(res)
+      return fallback()
     end
-    local codes = {}
+    local res, codes = {}, {}
     for i, code in (r.stdout or ""):gmatch("(%d+) (%d+)") do codes[tonumber(i)] = tonumber(code) end
     for i = 1, #cmds do
       local p, code = dir .. "/" .. i, codes[i]
@@ -312,7 +311,7 @@ local function git_batch(cmds, cb)
     local n = 0
     for _ in pairs(res) do n = n + 1 end
     if n == #cmds then return cb(res) end
-    fallback({})
+    fallback()
   end)
 end
 
