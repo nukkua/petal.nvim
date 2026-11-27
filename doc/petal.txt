@@ -17,20 +17,27 @@ CONTENTS                                                      *petal-contents*
 ==============================================================================
 1. INTRODUCTION                                                        *petal*
 
-petal shows a magit-style status buffer and runs every git command async
-through the git CLI. Pull requests go through `gh` (https://cli.github.com).
+Petal shows a Magit-style status buffer. Status refreshes and Git actions
+run asynchronously through the Git CLI; initial repository discovery and
+`git init` wait for Git. Pull requests use `gh` (https://cli.github.com).
 
-Requirements: Neovim 0.12+, `git`. Optional: `gh` for pull requests,
-fidget.nvim for progress spinners.
+Requirements: Neovim 0.12+, `git`, and a POSIX shell (`sh`). Conflict
+previews need Git 2.38+; moving hunks between commits needs Git 2.40+.
+Optional: authenticated `gh` for pull requests and fidget.nvim for
+progress spinners. Git cannot prompt for credentials; use an SSH agent or
+credential helper. The Git editor bridge does not support repository paths
+containing a single quote.
 
-Nothing is lost by accident: discarding tracked changes or a hard reset first
-saves a backup stash ("petal backup HH:MM:SS"), and discarded untracked files
-are moved to `.git/petal-trash/` instead of being deleted.
+The discard action and the hard reset popup try to back up tracked changes
+to a stash ("petal backup HH:MM:SS"), which you can restore with |petal-keys|
+`Z`. A failed backup does not cancel the action. Discarded untracked files
+are moved to `petal-trash/<timestamp>/` in the Git directory, not deleted.
 
 ==============================================================================
 2. SETUP                                                         *petal-setup*
 
-`setup()` is optional. These are the defaults:
+`setup()` is optional. It records options without loading the core until
+first use. These are the defaults:
 >lua
   require("petal").setup({
     reviewers = {},
@@ -52,13 +59,15 @@ reviewers                                              *petal-opt-reviewers*
 base_branches                                      *petal-opt-base_branches*
   Tried in order to find the integration branch, used by the "merged into"
   PR line, by |petal-diff| "Branch vs base" and by the conflict radar.
-  Falls back to `origin/HEAD`.
+  Falls back to the ref named by `origin/HEAD`, then to `origin/develop`
+  if that lookup fails.
 
   Conflict radar: on each refresh the status header gets a `Conflict:` line
   for the upstream (when diverged) and the base branch if merging it into
-  HEAD would conflict, with the files. It runs `git merge-tree --write-tree`
-  (git 2.38+), an in-memory merge that touches nothing. It checks a merge,
-  not a rebase, and ignores uncommitted changes. Clean: no line.
+  HEAD would conflict, with the files. Petal caches the result until HEAD
+  or the target changes. It runs `git merge-tree --write-tree` (Git 2.38+)
+  without changing the worktree, index, or refs. It checks a merge, not a
+  rebase, and ignores uncommitted changes. Clean: no line.
 
 recent                                                    *petal-opt-recent*
   Number of commits in the "Recent commits" section.
@@ -74,19 +83,23 @@ mappings                                                *petal-opt-mappings*
 
 watch                                                      *petal-opt-watch*
   Refresh the visible status when the repo changes on disk outside Neovim:
-  edits from another terminal or tool, commits, checkouts. Every directory
-  with a tracked or untracked file is watched (up to 1000; past that only
-  the git dir, so commits and staging still show). `false`: refresh only on
-  open, |BufWritePost|, |FocusGained| and `<C-r>`.
+  edits from another terminal or tool, commits, checkouts. Petal watches the
+  worktree root and directories containing tracked or untracked files.
+  At the 1000-directory limit it watches only the Git directory, including
+  `refs` and `refs/heads`. Without the watcher Petal still refreshes on open,
+  when the status buffer becomes visible again, on |BufWritePost| and
+  |FocusGained| while visible, after Git actions, and on `<C-r>`.
 
 simple                                                    *petal-opt-simple*
   `true`: petal as plain as it gets, a status buffer with the core keys.
-  Off in this mode: the PR line and every `gh` call from the status, the
+  Off in this mode: the automatic PR line and branch-list PR badges, the
   conflict radar, the background fetch on open, |petal-opt-watch| and the
   file summary under the commit buffer. Default keys left: `c b f p P l Z`
   (commit, branch, fetch, pull, push, log, stash), `s S <C-s> u U x`, `d e`,
   `<C-r> <CR>`, the folds, `?` and `q`. Every other action can still be
-  bound with |petal-mappings|, e.g. `mappings = { r = "rebase" }`.
+  bound with |petal-mappings|, e.g. `mappings = { r = "rebase", O = "pr" }`.
+  Pull and push can still fetch, and the commit message suggestion still
+  runs if configured.
 
 ==============================================================================
 3. USAGE                                                         *petal-usage*
@@ -94,20 +107,27 @@ simple                                                    *petal-opt-simple*
                                                                       *:Petal*
 :Petal                  Open the status buffer for the repo of the current
                         directory. Outside a repo it offers `git init`.
-:Petal {args}           Run `git {args}` and show its output, e.g.
-                        `:Petal log -5`.
+:Petal {args}           Run `git {args}` through `sh` and show its output,
+                        e.g. `:Petal log -5`. After the status has been
+                        opened, the command uses that repository's root.
+                        Short output is a message; long output opens a
+                        buffer. `Q` prompts for the same arguments.
 
                                                                     *:DiffOff*
 :DiffOff                Close the diff opened with `d` and go back to the
                         status, leaving the file as it is. `ZZ`/`ZQ` in the
                         diff do the same after saving/dropping the edits.
 
-Lua: `require("petal").open()`, `require("petal").command("log -5")`.
+Lua: `require("petal").open()` opens status, `refresh()` refreshes an
+existing status buffer, `command("log -5")` runs a command (`command()`
+prompts), and `diff_off()` does the same as |:DiffOff|.
 
 Popups list their actions; `-` followed by a key toggles an argument (it is
 remembered per popup), `q` or <Esc> closes. Actions run on the item under the
-cursor, or on a visual selection where that makes sense (stage, discard,
-cherry-pick, ...).
+cursor, or on a visual selection where supported (stage, unstage, discard,
+untrack, cherry-pick, revert). In pickers <CR> selects and `q`, <Esc>, or
+leaving the picker window cancels. Petal uses a new quickfix list for the
+picker, so |:colder| gets the previous list back.
 
 ==============================================================================
 4. KEYS                                                           *petal-keys*
@@ -117,7 +137,7 @@ The action name is what |petal-mappings| uses.
 
                                                                *petal-actions*
 Key     Action           Does ~
-`$`     history          Log of every git command petal ran
+`$`     history          Last 100 logged commands with elapsed time and output
 `A`     cherry_pick      Cherry-pick popup
 `b`     branch           Branch popup
 `B`     bisect           Bisect popup
@@ -158,7 +178,8 @@ Key     Action           Does ~
                          `]c`/`[c` jump conflicts, Vim's diff jump when none
                          is left in that direction
                          `ZZ` saves and closes, `ZQ` drops unsaved edits and
-                         closes (`q` is left for macros)
+                         closes (`q` is left for macros). Saving stages the
+                         file if no conflict markers remain
                          The marker lines and panes say who ours/theirs are
                          (in a rebase ours is the upstream) and how old each
                          side is. Under 160 columns or 36 lines only the file
@@ -180,7 +201,11 @@ it; then one `rebase -i --autosquash --autostash` folds the fixups in. A
 preview lists where each hunk goes before anything is rewritten. Hunks with
 no single unpushed owner (pushed code, lines from two commits, new, deleted,
 renamed, binary or mode-changed files) stay staged. A pure insertion goes to
-the commit that owns the lines around it. The old HEAD is in the reflog.
+the commit that owns the lines around it. "Unpushed" here and in |petal-move|
+means reachable from HEAD but not from any locally known remote-tracking
+ref. Both actions refuse unpushed history with merge commits and require
+any merge, rebase, cherry-pick or revert in progress to be finished first.
+The old HEAD is in the reflog.
 
                                                                *petal-move*
 Move (`o` in a commit view, opened with <CR> on a commit): moves the hunk
@@ -192,47 +217,56 @@ untouched. HEAD moves only if every commit replays cleanly and the final tree
 is identical to HEAD's, so the end result never changes; otherwise nothing
 does and the message names the commit that would conflict. A commit left
 empty is dropped. Author, date and message are kept. Only changes to
-existing text files move, and only in linear unpushed history.
+existing text files move, and the root commit cannot be rewritten.
 
                                                            *petal-branches*
 `b l` (local) and `b R` (remote) open the branches as a list at the bottom,
 newest first, the current branch (in `b R`: its upstream) tagged and the
 cursor on it, each with its age, last subject and PR badge (`#12 open`, from
-one `gh pr list`, rechecked like the PR line and after a manual fetch).
+one `gh pr list` cached for a minute, invalidated by manual fetch).
 <CR> switches to the branch under the cursor and closes the list; on a
-remote branch it creates the local tracking branch. `q` closes.
+remote row it runs `git switch` with the short branch name, using Git's
+normal local branch or remote-tracking guess. `q` closes.
 
 The local list is a buffer you edit like text (oil-style); `:w` applies:
-  `dd`        delete; a branch's upstream is deleted on the remote too
+  `dd`      delete; a branch's upstream may be deleted on the remote too
             (unless you pick "Local only"). Never the remote's default
             branch, |petal-opt-base_branches|, or an upstream another branch
             still tracks
   `yy` `p`    copy: the pasted line, renamed, becomes a branch at that commit
   `cw` `cc`   rename (`branch -m`, keeps upstream and reflog)
   `o`         a new line creates a branch at HEAD
-Every save asks once, before anything runs: the dialog lists each change,
-flags branches that aren't merged (their commits will be lost), and which
-upstreams go too: Apply + remote, Local only, or Cancel. Then the local
-deletes run as one `git branch -D`, and the remote ones as one
-`git push --delete` per remote in the background. Refused: deleting the
+Saving changes asks once before applying them: the dialog lists each
+change, flags branches that aren't merged into their upstream (or HEAD
+when the upstream is absent), and lists which upstreams can be deleted.
+Choose Apply or Cancel; when upstreams are listed, choose Apply + remote,
+Local only, or Cancel. Local deletes run as one `git branch -D`, and remote
+deletes as one `git push --delete` per remote in the background. Refused:
+deleting the
 checked-out branch, a name listed twice, a name that already exists (swap
-names in two saves), `<remote>/…` names, and invalid names. The first failing
-step stops the rest; the list then reloads to show what was done. <CR> and
-`q` ask you to save or undo first.
+names in two saves), `<remote>/…` names, and invalid names. A failed batch
+delete skips subsequent operations. A failed rename or create stops the
+remaining renames/creates, but approved upstream deletions still run. The
+list reloads after applying local edits. <CR> requires a save or undo first;
+`q` lets you confirm discarding unsaved edits.
 
-The remote list is edited the same way, for cleanup only: `dd` a branch whose
-PR badge says merged, or `X` to drop every such line at once, then `:w` asks
-once and runs one `git push --delete` per remote. Refused (the save does
-nothing): any other edit, a branch without a merged PR, one a local branch
+The remote list is edited the same way, for cleanup only: `dd` an eligible
+branch whose PR badge says merged, or `X` to drop all eligible lines.
+Then `:w` asks once and runs one `git push --delete` per remote. Refused
+(the save does nothing): any other edit, a branch without a merged PR, one a local branch
 still has (same name or its upstream: delete that in `b l` first), and the
 remote's default branch or |petal-opt-base_branches|. PRs are matched by head
-branch name, so the list needs `gh`.
+branch name, not by repository or remote; a merged fork PR with the same
+head name can count. Cleanup needs PR badges, which require `gh` and are
+disabled in simple mode.
 
-Log views get the popup keys (`$` to `Z` above) plus goto and help; commit and
-diff views also get the fold keys.
+Log views get the command keys (`$` to `Z` above) plus goto and help;
+commit, stash, and diff views also get the fold keys. `q` returns from
+these views. In a merge commit view, <CR> on a parent opens it.
 
-In the commit message buffer (the window below lists the files being
-committed with +/- counts; `za` on one shows its diff, `q` closes it):
+In the commit message buffer (outside simple mode, the window below lists
+the files being committed with +/- counts; `za` expands a diff and `q`
+closes the summary):
 <C-c><C-c>              Save and commit
 <C-c><C-k>              Abort
 <C-c><C-s>              Accept the suggested message |petal-commit-suggest|
@@ -274,29 +308,43 @@ foldable diffs, <CR> on a diff line opens the file at that line.
 7. PULL REQUESTS                                                    *petal-pr*
 
 Needs `gh` logged in (`gh auth login`). The status shows the PR of the current
-branch under "Push" (state, mergeable, review, CI). `O` opens the PR popup:
+branch under "Push" (state, mergeability, review, CI). If Petal does not
+find a PR, it shows whether HEAD is merged into the configured base.
+Opening status rechecks the PR; otherwise the cached result is reused for
+up to a minute, or invalidated by a manual fetch. `O` opens the PR popup:
 
   `p`  Status            PR summary of this branch
-  `l`  List              open PRs, <CR> copies the URL
+  `l`  List              up to 30 open PRs, <CR> copies the URL
   `o`  Open              open this branch's PR in the browser, copy URL
   `c`  Checkout          pick a PR and `gh pr checkout` it
   `d`  Diff              this branch's PR diff (`gh pr diff`) in the diff view
-  `k`  Checks / CI log   checks of this branch's PR, failures first. <CR> on
-                        a failed GitHub Actions job shows the log of its
-                        failed steps, any other check opens in the browser
+  `k`  Checks / CI log   checks of this branch's PR, failures then pending.
+                        <CR> on a failed GitHub Actions check shows its
+                        failed-step log (or opens the page if it's empty);
+                        other checks open their links in the browser
   `n`  Create            `gh pr create --fill`, asking for reviewers when
-                        |petal-opt-reviewers| is set
+                        |petal-opt-reviewers| is nonempty; copies the URL
+                        (also when the PR already exists)
   `x`  Close             close this branch's PR
+
+In the reviewer picker, <Tab> toggles the current row and moves down.
+<CR> confirms marked rows, or the current row if none are marked. The
+`(no reviewer)` row adds no reviewer; select it alone to skip review.
 
 ==============================================================================
 8. COMMIT MESSAGE SUGGESTIONS                           *petal-commit-suggest*
 
-Set `commit_suggest` to a command that reads the diff being committed on stdin and
-prints a commit message. It starts when the commit buffer opens; the
+Set `commit_suggest` to an argv list for a command that reads the diff on
+stdin and prints a commit message. Petal sends it the diff from the index
+Git will commit (including a temporary index, if any). For amend, the
+comparison is against HEAD's parent or the empty tree for a root commit.
+The command runs from the repo root when the commit buffer opens and the
+diff is nonempty. Choose the command with that access in mind. The
 suggestion shows as ghost text while the message is empty. <C-c><C-s>
 accepts it, <C-c><C-y> accepts it and commits at once; pressed early, either
-one happens when the message arrives. <C-c><C-y> never overwrites a message
-you typed. Closing the buffer stops the command.
+one takes effect when the message arrives if you're still in that buffer.
+<C-c><C-s> can replace typed text; <C-c><C-y> never overwrites it. Closing
+the buffer stops a running command.
 >lua
   require("petal").setup({
     commit_suggest = { "claude", "-p", "--model", "haiku",
@@ -319,7 +367,7 @@ With the builtin |vim.notify| they are echoed with an icon in
 `GitNotifyError`, `GitNotifyWarn` or `GitNotifyInfo` and the subject in
 `GitNotifySubject`; a notifier plugin gets the same text uncolored. "Nothing
 to do" answers from git (nothing to commit, no stash, no previous branch) are
-warnings, real failures are errors; `$` shows git's full output.
+warnings, real failures are errors; `$` shows the output of logged commands.
 
 ==============================================================================
 10. HEALTH                                                      *petal-health*
