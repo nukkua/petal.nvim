@@ -1226,6 +1226,50 @@ test("merge_mode: c-keys resolve on a marker, stay Vim's elsewhere; ZZ stages", 
   vim.fn.delete(cdir, "rf")
 end)
 
+test("d ribbon stages one shifted CRLF insertion from the exact nested file", function()
+  local rdir, g = repo()
+  local f, cwd = rdir .. "/nested/ribbon.txt", vim.fn.getcwd()
+  vim.fn.mkdir(rdir .. "/nested")
+  g({ "config", "diff.noprefix", "true" })
+  g({ "config", "core.autocrlf", "false" })
+  vim.fn.writefile({ "first\r", "second\r", "third\r", "fourth\r" }, f)
+  vim.fn.writefile({ "first\r", "second\r", "third\r", "fourth\r" }, rdir .. "/ribbon.txt")
+  g({ "add", "." }); g({ "commit", "-qm", "base" })
+  local work = { "not staged\r", "first\r", "second\r", "third\r", "stage me\r", "fourth\r" }
+  vim.fn.writefile(work, f)
+  local old_ribbons, hunk, actions
+  old_ribbons = package.loaded.diff_ribbons
+  package.loaded.diff_ribbons = { copy_hunk = function() end, attach = function(before, after, opts)
+    actions = opts.actions
+    hunk = {
+      before = { buf = vim.api.nvim_win_get_buf(before), start = 3, count = 0 },
+      after = { buf = vim.api.nvim_win_get_buf(after), start = 4, count = 1 },
+    }
+  end }
+  vim.cmd.cd(rdir)
+  petal.open()
+  local pat = "modified.*nested/ribbon\\.txt"
+  assert(shown(pat))
+  vim.fn.cursor(vim.fn.search(pat, "nw"), 1)
+  vim.api.nvim_feedkeys("d", "x", false)
+  assert(vim.wait(3000, function() return actions ~= nil end, 10))
+  actions.apply(hunk)
+  local function index(path)
+    return vim.system({ "git", "show", ":" .. path }, { cwd = rdir }):wait().stdout
+  end
+  assert(vim.wait(3000, function()
+    return index("nested/ribbon.txt") == "first\r\nsecond\r\nthird\r\nstage me\r\nfourth\r\n"
+  end, 20))
+  eq(index("ribbon.txt"), "first\r\nsecond\r\nthird\r\nfourth\r\n")
+  eq(vim.fn.readfile(f, "b"), vim.list_extend(work, { "" }))
+  vim.cmd.DiffOff()
+  vim.cmd("normal q")
+  vim.api.nvim_buf_delete(hunk.after.buf, { force = true })
+  package.loaded.diff_ribbons = old_ribbons
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+end)
+
 test("d: ZZ from the HEAD pane writes the file and returns, ZQ drops the edit; then they are Vim's", function()
   local rdir, g = repo()
   local f = rdir .. "/v.txt"

@@ -64,8 +64,10 @@ action yourself, e.g. `mappings = { r = "rebase", O = "pr" }`.
   dropping edits; in the diff, `ZZ` saves and `ZQ` discards unsaved edits. `e` opens conflict
   resolution on a conflicted file.
 - Install [diff-ribbons.nvim](https://github.com/nukkua/diff-ribbons.nvim) to connect changes
-  across the two panes opened by `d`, using your colorscheme. Set `diff_ribbons = false` to
-  keep the native view even when the plugin is installed.
+  across the two panes opened by `d`. Click a ribbon's `>` to stage a matching saved hunk
+  or `<` to restore its HEAD lines in the local buffer without saving. From a changed line,
+  use `:DiffRibbonsApply` or `:DiffRibbonsRevert` instead. Set `diff_ribbons = false` to
+  keep the native view.
 - `D` opens the diff popup: what your branch adds vs its base (`base...HEAD`), vs any ref, or any range.
 - `b l` and `b R` list local and remote branches. Use `<CR>` to switch or edit the list and write
   it with `:w`; remote edits are limited to deleting eligible branches with merged PRs.
