@@ -2708,6 +2708,7 @@ end
 local function ribbon_patch(raw, hunk)
   local old = vim.api.nvim_buf_get_lines(hunk.before.buf, hunk.before.start, hunk.before.start + hunk.before.count, true)
   local new = vim.api.nvim_buf_get_lines(hunk.after.buf, hunk.after.start, hunk.after.start + hunk.after.count, true)
+  local dos = vim.bo[hunk.after.buf].fileformat == "dos"
   local header, part, removed, added, staged, seen_hunk = {}, nil, {}, {}, nil, false
   local function finish()
     if part and vim.deep_equal(old, removed) and vim.deep_equal(new, added) then
@@ -2715,17 +2716,23 @@ local function ribbon_patch(raw, hunk)
     end
   end
   scan_lines(raw, function(line)
-    local n, count = line:match("^@@ %-%d+,?%d* %+(%d+),?(%d*) @@")
+    local o, oc, n, count = line:match("^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@")
     if n then
       finish()
       seen_hunk, count = true, tonumber(count) or 1
       local start = tonumber(n) - (count > 0 and 1 or 0)
-      part = start == hunk.after.start and count == hunk.after.count and { line } or nil
+      part = nil
+      if start == hunk.after.start and count == hunk.after.count then
+        -- A patch by itself has none of the line shifts from earlier unstaged hunks.
+        local new_line = tonumber(o) - ((tonumber(oc) or 1) > 0 and 1 or 0) + (count > 0 and 1 or 0)
+        part = { ("@@ -%s%s +%d,%d @@"):format(o, oc == "" and "" or "," .. oc, new_line, count) }
+      end
       removed, added = {}, {}
     elseif part then
       local prefix = line:sub(1, 1)
-      if prefix == "-" then removed[#removed + 1] = line:sub(2) end
-      if prefix == "+" then added[#added + 1] = line:sub(2) end
+      local content = dos and line:sub(2):gsub("\r$", "") or line:sub(2)
+      if prefix == "-" then removed[#removed + 1] = content end
+      if prefix == "+" then added[#added + 1] = content end
       part[#part + 1] = line
     elseif not seen_hunk and (line:match("^diff %-%-git ") or line:match("^%-%-%- ") or line:match("^%+%+%+ ")) then
       header[#header + 1] = line
@@ -2791,14 +2798,15 @@ function vimdiff_open(root, rel, head)
             local tick = vim.api.nvim_buf_get_changedtick(work_buf)
             staging = true
             git({ "--literal-pathspecs", "diff", "--no-color", "--no-renames", "--no-ext-diff", "--no-textconv",
-              "--unified=0", "--", rel }, nil, function(r)
+              "--src-prefix=a/", "--dst-prefix=b/", "--unified=0", "--inter-hunk-context=0", "--", rel },
+              { text = false }, function(r)
               staging = false
               if S.root ~= root or not vim.api.nvim_win_is_valid(head_win) or not vim.api.nvim_win_is_valid(work_win)
                 or vim.api.nvim_win_get_buf(work_win) ~= work_buf or vim.api.nvim_buf_get_changedtick(work_buf) ~= tick then return end
               local p = r.code == 0 and ribbon_patch(r.stdout or "", hunk)
               if not p then return notify("No matching unstaged hunk; use the status view to stage changes", warn) end
               staging = true
-              git({ "apply", "--cached", "--unidiff-zero", "-" }, { stdin = p }, function(result)
+              git({ "apply", "--cached", "--unidiff-zero", "--whitespace=nowarn", "-" }, { stdin = p }, function(result)
                 staging = false
                 if result.code ~= 0 then return notify("Could not stage hunk: " .. vim.trim(result.stderr or ""), warn) end
                 notify("Hunk staged")
