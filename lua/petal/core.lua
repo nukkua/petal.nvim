@@ -16,6 +16,7 @@ local C = {
                                                        -- <c-c><c-y> accepts and commits
   mappings = {},                                       -- status keys: { [key] = action name | false }, see :h petal-mappings
   watch = true,                                        -- refresh the open status when the repo changes on disk
+  diff_ribbons = true,                                 -- add a ribbon gutter to d when diff-ribbons.nvim is installed
   simple = false,                                      -- just status + core keys: no PR line, conflict radar,
                                                        -- background fetch, watcher or commit summary, see :h petal-opt-simple
 }
@@ -2664,9 +2665,9 @@ function M.command(cmd)
   input("git ", nil, go)
 end
 
--- d: plain vimdiff of the file under the cursor vs HEAD, no plugins
+-- d: vimdiff of the file under the cursor vs HEAD
 -- ponytail: untracked files have no HEAD to diff, so they warn
-local vimdiff_open
+local vimdiff_open, close_ribbons
 local function vimdiff()
   local it = (S.rows[S.buf] or {})[vim.fn.line(".")]
   if not (it and it.file) then return notify("diff: no file under cursor", vim.log.levels.WARN) end
@@ -2691,6 +2692,7 @@ local function diff_close(save)
       vim.api.nvim_buf_call(b, function() vim.cmd(save and "silent write" or "silent edit!") end)
     end
   end
+  if close_ribbons then close_ribbons(); close_ribbons = nil end
   vim.cmd("diffoff!")
   for _, w in ipairs(vim.api.nvim_list_wins()) do
     local b = vim.api.nvim_win_get_buf(w)
@@ -2717,8 +2719,8 @@ function vimdiff_open(root, rel, head)
   local work_win, work_buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
   local ft = vim.bo.filetype
   vim.cmd("diffthis")
-  vim.api.nvim_set_option_value("winbar", "%#Comment# working %*", { win = work_win })
-  vim.cmd("vnew")
+  vim.api.nvim_set_option_value("winbar", "%#Comment# local %*", { win = work_win })
+  vim.cmd("leftabove vnew")
   local head_win, head_buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
   vim.api.nvim_buf_set_lines(0, 0, -1, false, head)
   pcall(vim.api.nvim_buf_set_name, 0, "HEAD:" .. rel)
@@ -2731,11 +2733,15 @@ function vimdiff_open(root, rel, head)
   vim.bo.modifiable = false
   vim.b.git_head_scratch = true
   vim.cmd("diffthis")
-  vim.api.nvim_set_option_value("winbar", "%#Comment# head %*", { win = head_win })
+  vim.api.nvim_set_option_value("winbar", "%#Comment# HEAD %*", { win = head_win })
   local function close(save) return function() diff_close(save); M.open() end end
   for _, b in ipairs({ work_buf, head_buf }) do
     vim.keymap.set("n", "ZZ", close(true), { buffer = b, nowait = true })
     vim.keymap.set("n", "ZQ", close(false), { buffer = b, nowait = true })
+  end
+  if C.diff_ribbons then
+    local ok, ribbons = pcall(require, "diff_ribbons")
+    if ok then close_ribbons = ribbons.attach(head_win, work_win) end
   end
 end
 

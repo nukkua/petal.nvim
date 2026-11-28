@@ -39,6 +39,7 @@ require("petal").setup({
   commit_suggest = nil,                                -- agent that suggests commit messages, see below
   mappings = {},                                       -- status keys, see below
   watch = true,                                        -- refresh when the repo changes outside nvim
+  diff_ribbons = true,                                 -- use the optional diff-ribbons.nvim gutter with d
   simple = false,                                      -- core status and keys only, see below
 })
 
@@ -59,9 +60,12 @@ action yourself, e.g. `mappings = { r = "rebase", O = "pr" }`.
   one. Press `?` to list your active keys. Full docs: `:h petal`.
 - `:Petal <args>` runs `git <args>` through the shell (e.g. `:Petal log -5`); `Q` prompts for the
   arguments. After opening Petal, commands run from the selected repository root.
-- `d` compares the working file against HEAD. `:DiffOff` returns to status without saving or
+- `d` compares `HEAD` (left) with the `local` file (right). `:DiffOff` returns to status without saving or
   dropping edits; in the diff, `ZZ` saves and `ZQ` discards unsaved edits. `e` opens conflict
   resolution on a conflicted file.
+- Install [diff-ribbons.nvim](https://github.com/nukkua/diff-ribbons.nvim) to connect changes
+  across the two panes opened by `d`, using your colorscheme. Set `diff_ribbons = false` to
+  keep the native view even when the plugin is installed.
 - `D` opens the diff popup: what your branch adds vs its base (`base...HEAD`), vs any ref, or any range.
 - `b l` and `b R` list local and remote branches. Use `<CR>` to switch or edit the list and write
   it with `:w`; remote edits are limited to deleting eligible branches with merged PRs.
