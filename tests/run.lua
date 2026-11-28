@@ -1252,7 +1252,16 @@ test("d: ZZ from the HEAD pane writes the file and returns, ZQ drops the edit; t
   eq(vim.fn.bufnr("HEAD:v.txt"), -1, "HEAD scratch left behind")
   eq(zmap(fbuf, "ZZ"), "", "ZZ map stayed on the file buffer")
   -- ZQ (from the working pane) leaves the file on disk unchanged
+  local old_ribbons, attached, detached = package.loaded.diff_ribbons, nil, 0
+  package.loaded.diff_ribbons = {
+    attach = function(before, after)
+      attached = { before, after }
+      return function() detached = detached + 1 end
+    end,
+  }
   open_diff("modified.*v\\.txt")
+  eq(attached, { vim.fn.bufwinid(vim.fn.bufnr("HEAD:v.txt")), vim.fn.bufwinid(fbuf) })
+  eq({ vim.wo[attached[1]].diff, vim.wo[attached[2]].diff }, { true, true })
   vim.api.nvim_buf_set_lines(fbuf, 0, -1, false, { "dropped" })
   vim.api.nvim_set_current_win(vim.fn.bufwinid(fbuf))
   vim.api.nvim_feedkeys("ZQ", "x", false)
@@ -1260,9 +1269,15 @@ test("d: ZZ from the HEAD pane writes the file and returns, ZQ drops the edit; t
   eq(vim.api.nvim_buf_get_lines(fbuf, 0, -1, false), { "edited" }, "ZQ kept the edit in the buffer")
   eq(vim.fn.bufnr("HEAD:v.txt"), -1, "HEAD scratch left behind")
   eq(zmap(fbuf, "ZQ"), "", "ZQ map stayed on the file buffer")
+  eq(detached, 1, "ZQ did not close the ribbon gutter")
   -- :DiffOff clears the maps too
+  petal.setup({ diff_ribbons = false })
+  attached = nil
   open_diff("modified.*v\\.txt")
+  eq(attached, nil, "d opened a gutter despite diff_ribbons=false")
   vim.cmd("DiffOff")
+  petal.setup({ diff_ribbons = true })
+  package.loaded.diff_ribbons = old_ribbons
   eq(zmap(fbuf, "ZZ"), "", ":DiffOff left the ZZ map")
   -- deleted in the worktree: the working side is a nofile buffer, ZZ closes without writing or throwing
   vim.fn.delete(f)
