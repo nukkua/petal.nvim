@@ -300,7 +300,9 @@ An unknown action name is reported once with a warning, and by
 
 `d` on a file opens a vimdiff with `HEAD` on the left and the `local` file
 on the right. |:DiffOff| closes it. See |petal-opt-diff_ribbons| for an
-optional connector gutter.
+optional connector gutter. Click > to stage a matching saved hunk or <
+to restore the HEAD lines in the local buffer without saving. On a changed
+line, :DiffRibbonsApply and :DiffRibbonsRevert do the same.
 `D` opens the diff popup:
 
   `b`  Branch vs base   what the branch adds: `<base>...HEAD`, base from

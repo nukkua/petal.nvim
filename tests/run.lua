@@ -1226,6 +1226,38 @@ test("merge_mode: c-keys resolve on a marker, stay Vim's elsewhere; ZZ stages", 
   vim.fn.delete(cdir, "rf")
 end)
 
+test("d ribbon stages one saved hunk without staging another", function()
+  local rdir, g = repo()
+  local f, cwd = rdir .. "/v.txt", vim.fn.getcwd()
+  vim.fn.writefile({ "old start", "keep", "old end" }, f)
+  g({ "add", "." }); g({ "commit", "-qm", "base" })
+  vim.fn.writefile({ "new start", "keep", "new end" }, f)
+  local old_ribbons, hunk, actions
+  old_ribbons = package.loaded.diff_ribbons
+  package.loaded.diff_ribbons = { copy_hunk = function() end, attach = function(before, after, opts)
+    actions = opts.actions
+    hunk = {
+      before = { buf = vim.api.nvim_win_get_buf(before), start = 2, count = 1 },
+      after = { buf = vim.api.nvim_win_get_buf(after), start = 2, count = 1 },
+    }
+  end }
+  vim.cmd.cd(rdir)
+  petal.open()
+  local pat = "modified.*v\\.txt"
+  assert(shown(pat))
+  vim.fn.cursor(vim.fn.search(pat, "nw"), 1)
+  vim.api.nvim_feedkeys("d", "x", false)
+  assert(vim.wait(3000, function() return actions ~= nil end, 10))
+  actions.apply(hunk)
+  assert(vim.wait(3000, function() return g({ "show", ":v.txt" }) == "old start\nkeep\nnew end\n" end, 20))
+  eq(vim.fn.readfile(f), { "new start", "keep", "new end" })
+  vim.cmd.DiffOff()
+  vim.cmd("normal q")
+  package.loaded.diff_ribbons = old_ribbons
+  vim.cmd.cd(cwd)
+  vim.fn.delete(rdir, "rf")
+end)
+
 test("d: ZZ from the HEAD pane writes the file and returns, ZQ drops the edit; then they are Vim's", function()
   local rdir, g = repo()
   local f = rdir .. "/v.txt"
