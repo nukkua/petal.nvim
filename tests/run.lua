@@ -1259,9 +1259,16 @@ test("d: ZZ from the HEAD pane writes the file and returns, ZQ drops the edit; t
       return function() detached = detached + 1 end
     end,
   }
+  local splitright = vim.o.splitright
+  vim.o.splitright = true
   open_diff("modified.*v\\.txt")
+  vim.o.splitright = splitright
   eq(attached, { vim.fn.bufwinid(vim.fn.bufnr("HEAD:v.txt")), vim.fn.bufwinid(fbuf) })
   eq({ vim.wo[attached[1]].diff, vim.wo[attached[2]].diff }, { true, true })
+  eq(vim.api.nvim_tabpage_list_wins(0), attached, "HEAD must stay on the left even with splitright")
+  eq(vim.tbl_map(function(w)
+    return vim.trim(vim.api.nvim_eval_statusline(vim.wo[w].winbar, { winid = w, use_winbar = true }).str)
+  end, attached), { "HEAD", "local" })
   vim.api.nvim_buf_set_lines(fbuf, 0, -1, false, { "dropped" })
   vim.api.nvim_set_current_win(vim.fn.bufwinid(fbuf))
   vim.api.nvim_feedkeys("ZQ", "x", false)

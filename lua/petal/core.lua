@@ -2719,8 +2719,8 @@ function vimdiff_open(root, rel, head)
   local work_win, work_buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
   local ft = vim.bo.filetype
   vim.cmd("diffthis")
-  vim.api.nvim_set_option_value("winbar", "%#Comment# working %*", { win = work_win })
-  vim.cmd("vnew")
+  vim.api.nvim_set_option_value("winbar", "%#Comment# local %*", { win = work_win })
+  vim.cmd("leftabove vnew")
   local head_win, head_buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
   vim.api.nvim_buf_set_lines(0, 0, -1, false, head)
   pcall(vim.api.nvim_buf_set_name, 0, "HEAD:" .. rel)
@@ -2733,7 +2733,7 @@ function vimdiff_open(root, rel, head)
   vim.bo.modifiable = false
   vim.b.git_head_scratch = true
   vim.cmd("diffthis")
-  vim.api.nvim_set_option_value("winbar", "%#Comment# head %*", { win = head_win })
+  vim.api.nvim_set_option_value("winbar", "%#Comment# HEAD %*", { win = head_win })
   local function close(save) return function() diff_close(save); M.open() end end
   for _, b in ipairs({ work_buf, head_buf }) do
     vim.keymap.set("n", "ZZ", close(true), { buffer = b, nowait = true })

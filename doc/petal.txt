@@ -298,8 +298,9 @@ An unknown action name is reported once with a warning, and by
 ==============================================================================
 6. DIFFS                                                          *petal-diff*
 
-`d` on a file opens a vimdiff of the worktree against HEAD; |:DiffOff| closes
-it. See |petal-opt-diff_ribbons| for an optional connector gutter.
+`d` on a file opens a vimdiff with `HEAD` on the left and the `local` file
+on the right. |:DiffOff| closes it. See |petal-opt-diff_ribbons| for an
+optional connector gutter.
 `D` opens the diff popup:
 
   `b`  Branch vs base   what the branch adds: `<base>...HEAD`, base from

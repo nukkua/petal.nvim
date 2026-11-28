@@ -60,7 +60,7 @@ action yourself, e.g. `mappings = { r = "rebase", O = "pr" }`.
   one. Press `?` to list your active keys. Full docs: `:h petal`.
 - `:Petal <args>` runs `git <args>` through the shell (e.g. `:Petal log -5`); `Q` prompts for the
   arguments. After opening Petal, commands run from the selected repository root.
-- `d` compares the working file against HEAD. `:DiffOff` returns to status without saving or
+- `d` compares `HEAD` (left) with the `local` file (right). `:DiffOff` returns to status without saving or
   dropping edits; in the diff, `ZZ` saves and `ZQ` discards unsaved edits. `e` opens conflict
   resolution on a conflicted file.
 - Install [diff-ribbons.nvim](https://github.com/nukkua/diff-ribbons.nvim) to connect changes
